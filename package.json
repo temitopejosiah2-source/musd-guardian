@@ -1,0 +1,38 @@
+{
+  "name": "musd-guardian",
+  "version": "1.0.0",
+  "description": "Telegram alerts for MUSD activity on Mezo testnet",
+  "main": "dist/watch.js",
+  "scripts": {
+    "balance": "tsx src/balance.ts",
+    "discover": "tsx src/discover.ts",
+    "start": "tsx src/watch.ts",
+    "watch": "tsx src/watch.ts",
+    "health": "tsx src/health.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-test-coverage --import tsx --test src/*.test.ts",
+    "lint": "eslint .",
+    "build": "tsc --noEmit false"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "18.0.7",
+    "viem": "2.57.4",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "eslint": "10.12.0",
+    "eslint-plugin-security": "4.2.0",
+    "globals": "17.13.0",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

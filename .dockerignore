@@ -1,0 +1,6 @@
+**/.env*
+**/state.json*
+**/discovery.json
+**/node_modules
+**/.git
+dist

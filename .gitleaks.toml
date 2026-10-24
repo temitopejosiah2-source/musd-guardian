@@ -1,0 +1,11 @@
+title = "MUSD Guardian secret scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented example environment files contain placeholders only"
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)(node_modules|\.next|dist|coverage)/''',
+]

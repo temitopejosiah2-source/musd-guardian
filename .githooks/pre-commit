@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  name=${file##*/}
+  if [[ "$name" == .env || ( "$name" == .env.* && "$name" != .env.example ) ]]; then
+    printf '%s\n' "Commit blocked: environment file staged ($file)." >&2
+    exit 1
+  fi
+done <<< "$files"
+
+if git diff --cached --no-ext-diff --unified=0 -- |
+  grep -Eiq -- "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|[0-9]{8,10}:[A-Za-z0-9_-]{35}|[A-Za-z0-9_]*(KEY|SECRET|TOKEN)[A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*[\"']?(0x)?[A-Fa-f0-9]{32,}"; then
+  printf '%s\n' "Commit blocked: staged changes match a private-key or credential pattern." >&2
+  exit 1
+fi

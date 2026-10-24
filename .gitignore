@@ -1,0 +1,15 @@
+.env
+.env.local
+state.json
+state.json.bak
+state.json.*.tmp
+discovery.json
+node_modules
+web/node_modules
+web/.env*
+!web/.env.example
+web/.next/
+web/tsconfig.tsbuildinfo
+dist/
+coverage/
+.state-recovery-*.json*
