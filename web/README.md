@@ -18,6 +18,7 @@ Open `http://localhost:3000`. RPC and contract reads run server-side; no wallet 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `RPC_URL` | No | `https://rpc.test.mezo.org` | Mezo Testnet JSON-RPC URL. Keep it server-only. |
+| `TRANSFERS_LOOKBACK_BLOCKS` | No | `6000` | Recent block range scanned for MUSD transfers (maximum `120000`). |
 | `WARN_LTV` | No | `70` | LTV at or above which a loan is WARNING. |
 | `DANGER_LTV` | No | `80` | LTV at or above which a loan is DANGER. |
 | `NEXT_PUBLIC_TELEGRAM_BOT_URL` | No | — | Link to the Telegram alert bot. |
@@ -44,7 +45,9 @@ Content Security Policy and security headers. The API has bounded upstream
 work, 15-second response caching, and a sliding-window rate limit. Configure
 `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` for a shared
 serverless rate limit. Without both, the in-memory fallback is per instance
-only and can be reset or bypassed across serverless instances.
+only and can be reset or bypassed across serverless instances. Health reads
+have an independent 25-second budget; transfer scans use a separate 20-second
+budget and return partial activity when that limit is reached.
 
 The dashboard reads public testnet information only. It does not handle private
 keys or send blockchain transactions. Testnet RPC availability is not

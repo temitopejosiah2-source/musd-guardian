@@ -64,9 +64,13 @@ function isHealthResponse(value: unknown): value is HealthResponse {
     typeof result.updatedAt === "string" &&
     typeof result.troveActive === "boolean" &&
     typeof result.collateralBtc === "number" &&
+    Number.isFinite(result.collateralBtc) &&
     typeof result.debtMusd === "number" &&
+    Number.isFinite(result.debtMusd) &&
     typeof result.btcPriceUsd === "number" &&
+    Number.isFinite(result.btcPriceUsd) &&
     typeof result.ltvPercent === "number" &&
+    Number.isFinite(result.ltvPercent) &&
     (result.level === "SAFE" ||
       result.level === "WARNING" ||
       result.level === "DANGER" ||
@@ -81,7 +85,20 @@ function isTransfersResponse(value: unknown): value is TransfersResponse {
     typeof result.address === "string" &&
     typeof result.updatedAt === "string" &&
     typeof result.partial === "boolean" &&
-    Array.isArray(result.transfers)
+    Array.isArray(result.transfers) &&
+    result.transfers.every((item) => {
+      if (typeof item !== "object" || item === null) return false;
+      const transfer = item as Record<string, unknown>;
+      return (
+        (transfer.direction === "IN" || transfer.direction === "OUT") &&
+        typeof transfer.amount === "string" &&
+        typeof transfer.counterparty === "string" &&
+        typeof transfer.block === "string" &&
+        typeof transfer.txHash === "string" &&
+        typeof transfer.logIndex === "number" &&
+        typeof transfer.explorerLink === "string"
+      );
+    })
   );
 }
 
@@ -106,6 +123,19 @@ function staleMessage(updatedAt: string): string {
   if (Number.isNaN(timestamp)) return "Showing previously cached data.";
   const minutes = Math.max(1, Math.floor((Date.now() - timestamp) / 60_000));
   return `Showing data from ${minutes} min ago.`;
+}
+
+function retryDelay(attempt: number): number | undefined {
+  switch (attempt) {
+    case 0:
+      return 3_000;
+    case 1:
+      return 6_000;
+    case 2:
+      return 12_000;
+    default:
+      return undefined;
+  }
 }
 
 function getLevelDetails(level: HealthLevel | null) {
@@ -144,6 +174,11 @@ export default function Dashboard() {
   const fetchAddress = useCallback(async (value: string) => {
     const valid = validateAddress(value);
     if (!valid) {
+      requestIdRef.current += 1;
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       setError("Enter a valid Mezo EVM address to check its loan.");
       healthRef.current = null;
       setHealth(null);
@@ -195,7 +230,10 @@ export default function Dashboard() {
             );
             return;
           }
-          if (!isTransfersResponse(body)) {
+          if (
+            !isTransfersResponse(body) ||
+            body.address.toLowerCase() !== valid.toLowerCase()
+          ) {
             setTransferError("Recent activity returned an invalid response.");
             return;
           }
@@ -224,7 +262,10 @@ export default function Dashboard() {
           if (!response.ok) {
             throw requestError(response, body, "The testnet RPC is slow. Please retry.");
           }
-          if (!isHealthResponse(body)) {
+          if (
+            !isHealthResponse(body) ||
+            body.address.toLowerCase() !== valid.toLowerCase()
+          ) {
             throw new Error("Loan health returned an invalid response. Please retry.");
           }
           healthRef.current = body;
@@ -240,8 +281,7 @@ export default function Dashboard() {
                 ? healthError.message
                 : "Could not load loan health.",
             );
-            const retryDelays = [3_000, 6_000, 12_000];
-            const delay = retryDelays[retryIndex];
+            const delay = retryDelay(retryIndex);
             if (delay !== undefined) {
               retryTimerRef.current = window.setTimeout(() => {
                 retryTimerRef.current = null;
@@ -558,9 +598,9 @@ export default function Dashboard() {
               {staleTransfers && transferUpdatedAt ? (
                 <p className="stale-note">{staleMessage(transferUpdatedAt)}</p>
               ) : null}
+              {partialTransfers ? <p className="partial-note">Showing partial results; the testnet query reached its work limit.</p> : null}
               {transfers.length > 0 ? (
-                <>
-                  <ul className="activity-list">
+                <ul className="activity-list">
                     {transfers.map((transfer) => (
                       <li key={`${transfer.txHash}-${transfer.logIndex}`} className="activity-item">
                         <span className={`activity-direction ${transfer.direction === "IN" ? "direction-in" : "direction-out"}`} aria-label={transfer.direction === "IN" ? "Incoming" : "Outgoing"}>{transfer.direction === "IN" ? "↓" : "↑"}</span>
@@ -569,9 +609,7 @@ export default function Dashboard() {
                         <a href={transfer.explorerLink} target="_blank" rel="noreferrer" aria-label={`View transaction ${transfer.txHash} on Mezo Explorer`} className="activity-link">↗</a>
                       </li>
                     ))}
-                  </ul>
-                  {partialTransfers ? <p className="partial-note">Showing partial results; the testnet query reached its work limit.</p> : null}
-                </>
+                </ul>
               ) : !transferError ? (
                 <div className="empty-activity"><span aria-hidden="true">⌁</span><b>No recent transfers found</b><small>MUSD transfers from the configured recent block range will appear here.</small></div>
               ) : null}

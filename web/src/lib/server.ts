@@ -25,7 +25,7 @@ const TRANSFER_DEADLINE_MS = 19_000;
 const NATIVE_DECIMALS = 18;
 const FRESH_CACHE_MS = 15_000;
 const STALE_CACHE_MS = 5 * 60_000;
-const HEALTH_ATTEMPTS = 3;
+const HEALTH_ATTEMPTS = 4;
 
 const chain = defineChain({
   id: 31611,
@@ -186,7 +186,6 @@ const lastGoodHealth = new Map<string, { expiresAt: number; value: HealthRespons
 const transfersCache = new Map<string, { expiresAt: number; value: TransfersResponse }>();
 const lastGoodTransfers = new Map<string, { expiresAt: number; value: TransfersResponse }>();
 const MAX_CACHE_ENTRIES = 1000;
-let decimalsPromise: Promise<number> | undefined;
 
 function setCache<T>(
   cache: Map<string, { expiresAt: number; value: T }>,
@@ -246,20 +245,13 @@ function numeric(value: string): number {
 }
 
 function getMusdDecimals(): Promise<number> {
-  if (!decimalsPromise) {
-    decimalsPromise = publicClient
-      .readContract({
-        address: MUSD_ADDRESS,
-        abi: musdAbi,
-        functionName: "decimals",
-      })
-      .then(Number)
-      .catch((error: unknown) => {
-        decimalsPromise = undefined;
-        throw error;
-      });
-  }
-  return decimalsPromise;
+  return publicClient
+    .readContract({
+      address: MUSD_ADDRESS,
+      abi: musdAbi,
+      functionName: "decimals",
+    })
+    .then(Number);
 }
 
 function levelFor(ltv: number, active: boolean): HealthLevel {
@@ -463,11 +455,17 @@ function getLookbackBlocks(): bigint {
 async function fetchTransfers(address: Address): Promise<TransfersResponse> {
   const deadline = Date.now() + TRANSFER_DEADLINE_MS;
   const lookbackBlocks = getLookbackBlocks();
+  const partialResult = (): TransfersResponse => ({
+    address,
+    transfers: [],
+    partial: true,
+    updatedAt: new Date().toISOString(),
+  });
   const initialReads = await beforeDeadline(
     Promise.all([publicClient.getBlockNumber(), getMusdDecimals()]),
     deadline,
   );
-  if (!initialReads) throw new RpcFailure("RPC request failed");
+  if (!initialReads) return partialResult();
   const [latestBlock, decimals] = initialReads;
   const firstBlock = latestBlock >= lookbackBlocks - 1n
     ? latestBlock - lookbackBlocks + 1n
@@ -485,6 +483,7 @@ async function fetchTransfers(address: Address): Promise<TransfersResponse> {
   let nextChunk = 0;
   let successfulChunks = 0;
   let failedChunk = false;
+  let deadlineReached = false;
   const worker = async (): Promise<void> => {
     while (nextChunk < chunks.length && results.length < 10 && Date.now() < deadline) {
       const chunk = chunks[nextChunk++];
@@ -496,6 +495,7 @@ async function fetchTransfers(address: Address): Promise<TransfersResponse> {
         );
         if (!logs) {
           failedChunk = true;
+          deadlineReached = true;
           return;
         }
         successfulChunks += 1;
@@ -515,7 +515,10 @@ async function fetchTransfers(address: Address): Promise<TransfersResponse> {
     !finished ||
     failedChunk ||
     nextChunk < chunks.length && results.length < 10;
-  if (successfulChunks === 0) throw new RpcFailure("RPC request failed");
+  if (successfulChunks === 0) {
+    if (deadlineReached || Date.now() >= deadline) return partialResult();
+    throw new RpcFailure("RPC request failed");
+  }
 
   const value: TransfersResponse = {
     address,
@@ -542,8 +545,19 @@ export async function getTransfers(
   }
   try {
     const value = await fetchTransfers(address);
+    if (value.partial && value.transfers.length === 0) {
+      const previous = lastGoodTransfers.get(key);
+      if (previous && previous.expiresAt > Date.now()) {
+        return {
+          value: { ...previous.value, stale: true },
+          cache: "stale",
+        };
+      }
+    }
     setCache(transfersCache, key, value, FRESH_CACHE_MS);
-    setCache(lastGoodTransfers, key, value, STALE_CACHE_MS);
+    if (!value.partial || value.transfers.length > 0) {
+      setCache(lastGoodTransfers, key, value, STALE_CACHE_MS);
+    }
     return { value, cache: "miss" };
   } catch (error) {
     const previous = lastGoodTransfers.get(key);
