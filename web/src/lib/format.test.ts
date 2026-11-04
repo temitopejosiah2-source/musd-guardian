@@ -30,11 +30,13 @@ describe("dashboard pure functions", () => {
   it("classifies the configured warning and danger thresholds", () => {
     expect(classifyLevel(
       { collateralBtc: 1, debtMusd: 700, btcPriceUsd: 1_000, troveActive: true },
+      55,
       70,
       80,
     )).toBe("WARNING");
     expect(classifyLevel(
       { collateralBtc: 1, debtMusd: 800, btcPriceUsd: 1_000, troveActive: true },
+      55,
       70,
       80,
     )).toBe("DANGER");
@@ -43,14 +45,25 @@ describe("dashboard pure functions", () => {
   it("classifies safe and inactive loans", () => {
     expect(classifyLevel(
       { collateralBtc: 1, debtMusd: 100, btcPriceUsd: 1_000, troveActive: true },
+      55,
       70,
       80,
     )).toBe("SAFE");
     expect(classifyLevel(
       { collateralBtc: 0, debtMusd: 0, btcPriceUsd: 1_000, troveActive: false },
+      55,
       70,
       80,
     )).toBe("NO_LOAN");
+  });
+
+  it("classifies the monitor zone at its boundary", () => {
+    expect(classifyLevel(
+      { collateralBtc: 1, debtMusd: 550, btcPriceUsd: 1_000, troveActive: true },
+      55,
+      70,
+      80,
+    )).toBe("MONITOR");
   });
 
   it("validates EVM addresses without accepting malformed strings", () => {

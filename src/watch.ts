@@ -1,495 +1,149 @@
 import { createServer, type Server } from "node:http";
-import { formatUnits, getAddress, type Address, type Log } from "viem";
-import {
-  EXPLORER_URL,
-  getHealthAlertConfig,
-  getTelegramConfig,
-  getWatchAddress,
-} from "./config.js";
+import { randomUUID } from "node:crypto";
+import type { Address } from "viem";
+import { getHealthAlertConfig, getWatchAddress } from "./config.js";
 import { publicClient } from "./client.js";
-import {
-  getMusdBalance,
-  getMusdDecimals,
-  getTransferLogs,
-  LOG_CHUNK_SIZE,
-  transferDetails,
-} from "./musd.js";
-import { loadState, saveState, type WatchState } from "./state.js";
-import {
-  getTelegramUpdates,
-  sendTelegramMessage,
-  type TelegramUpdate,
-} from "./telegram.js";
+import { getMusdDecimals, LOG_CHUNK_SIZE } from "./musd.js";
 import { getLoanHealth, type LoanHealth } from "./loan.js";
-import type { HealthLevel } from "./state.js";
-import { authorizeTelegramCommand, logError, logInfo, redact } from "./security.js";
+import { runHealthCycle, processTransferRange, transitionLevel, processPriceDropAlerts } from "./monitor.js";
+import type { MessageSender } from "./monitor.js";
+import { OutboundQueue } from "./outbound.js";
+import { logError, logInfo, redact, registerChatId } from "./security.js";
+import { createStore, type Store } from "./store/index.js";
+import { MemoryStore } from "./store/memory.js";
+import { normalizeAddress } from "./store/validation.js";
+import { BotCommands, limitsFromEnvironment } from "./bot.js";
+import {
+  answerTelegramCallback,
+  getTelegramUpdates,
+  processTelegramUpdates,
+  sendTelegramMessage,
+} from "./telegram.js";
+import { ltvAtPrice } from "./risk.js";
 import { validateEnvironment } from "./env.js";
+import {
+  ExponentialBackoff,
+  retryLockRenewal,
+  ServiceStatusTracker,
+  stopIfLockLost,
+  type ServiceName,
+} from "./resilience.js";
 
-const POLL_INTERVAL_MS = 10_000;
-const MAX_RETRIES = 5;
-const HEALTH_FAILURE_ALERT_MS = 10 * 60 * 1000;
 const DRY_RUN = process.argv.includes("--dry-run");
-
+const LOCK_TTL_MS = 60_000;
+const LOCK_RENEW_INTERVAL_MS = 15_000;
+const LOCK_RENEW_TIMEOUT_MS = 10_000;
 let stopping = false;
-let state: WatchState | undefined;
-let simulatedLtv: number | undefined;
-let simulatedHealthLevel: HealthLevel | undefined;
-let wakePendingDelay: (() => void) | undefined;
+let lastCycleAt = 0;
 let startedAt = Date.now();
+let latestProcessedBlock: string | null = null;
 let httpServer: Server | undefined;
-const commandAbortController = new AbortController();
-const commandAttempts = new Map<string, number[]>();
+let commandController: AbortController | undefined;
+let outboundQueue: OutboundQueue | undefined;
+let wakeStop: (() => void) | undefined;
+const stopped = new Promise<void>((resolve) => { wakeStop = resolve; });
+const services = new ServiceStatusTracker(logInfo, logInfo);
+const redisFailures = new WeakSet<object>();
 
-class RetryFailedError extends Error {}
+function isRedisStoreSelected(): boolean {
+  const configured = process.env.STORE?.trim();
+  return configured === "redis" ||
+    (!configured && Boolean(
+      process.env.UPSTASH_REDIS_REST_URL?.trim() &&
+      process.env.UPSTASH_REDIS_REST_TOKEN?.trim(),
+    ));
+}
+
+function wasRedisFailure(error: unknown): boolean {
+  return typeof error === "object" && error !== null && redisFailures.has(error);
+}
 
 function requestStop(): void {
+  if (stopping) return;
   stopping = true;
-  wakePendingDelay?.();
-  commandAbortController.abort();
+  wakeStop?.();
+  commandController?.abort();
+  outboundQueue?.stop();
   httpServer?.close();
-  logInfo("Shutdown requested; finishing the current block range.");
+  logInfo("Shutdown requested.");
 }
 
 process.on("SIGINT", requestStop);
 process.on("SIGTERM", requestStop);
 
-async function withRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error;
-      if (stopping) throw error;
-      logError(
-        `${label}: ${errorSummary(error)}; attempt ${attempt}/${MAX_RETRIES}; ${
-          attempt === MAX_RETRIES
-            ? "no further retry"
-            : `retry in ${2 ** (attempt - 1)}s`
-        }`,
-      );
-      if (attempt < MAX_RETRIES) {
-        await delay(1000 * 2 ** (attempt - 1));
-      }
-    }
-  }
-  throw new RetryFailedError(`${label}: ${errorSummary(lastError)}`);
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function waitOrStop(milliseconds: number): Promise<void> {
+  return Promise.race([delay(milliseconds), stopped]);
 }
 
 function errorSummary(error: unknown): string {
-  let message: string;
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "shortMessage" in error &&
-    typeof error.shortMessage === "string"
-  ) {
-    message = error.shortMessage;
-  } else if (error instanceof Error) {
-    message = error.message.split(/\r?\n/, 1)[0] ?? "Unknown error";
-  } else {
-    message = "Unknown error";
-  }
+  const message = error instanceof Error ? error.message : "Unknown error";
   return redact(message).replace(/\s+/g, " ").slice(0, 240);
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    let finished = false;
-    const finish = () => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      if (wakePendingDelay === finish) wakePendingDelay = undefined;
-      resolve();
-    };
-    const timer = setTimeout(finish, milliseconds);
-    wakePendingDelay = finish;
-  });
-}
-
-function getSimulatedLtv(): number | undefined {
-  const index = process.argv.indexOf("--simulate-ltv");
-  if (index < 0) return undefined;
-  const rawValue = process.argv[index + 1];
-  const value = rawValue === undefined ? Number.NaN : Number(rawValue);
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error("--simulate-ltv requires a non-negative numeric value");
-  }
-  return value;
-}
-
-function getTelegramTestLtv(): number | undefined {
-  const index = process.argv.indexOf("--telegram-test");
-  if (index < 0) return undefined;
-  const nextArgument = process.argv[index + 1];
-  const value =
-    nextArgument === undefined || nextArgument.startsWith("--")
-      ? 85
-      : Number(nextArgument);
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error("--telegram-test LTV must be a non-negative number");
-  }
-  return value;
-}
-
-function eventId(log: Log): string {
-  if (!log.transactionHash || log.logIndex === null) {
-    throw new Error("Received a MUSD Transfer log without a transaction hash or log index");
-  }
-  return `${log.transactionHash}:${log.logIndex}`;
-}
-
-async function notify(
-  log: Log,
-  account: Address,
-  decimals: number,
-  send: ((text: string) => Promise<void>) | undefined,
-): Promise<void> {
-  const details = transferDetails(log, account, decimals);
-  const txHash = log.transactionHash;
-  if (!txHash) throw new Error("Received a MUSD Transfer log without a transaction hash");
-  const message = [
-    `${details.direction} ${details.amount} MUSD`,
-    `Counterparty: ${shortAddress(details.counterparty)}`,
-    `${EXPLORER_URL}/tx/${txHash}`,
-  ].join("\n");
-
-  if (!send) {
-    logInfo(`[dry-run]\n${message}`);
-  } else {
-    await withRetry("Telegram notification", () => send(message));
-  }
-}
-
-function shortAddress(address: Address): string {
-  const normalized = getAddress(address);
-  return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`;
-}
-
-function healthLevelFor(
-  ltv: number,
-  warnLtv: number,
-  dangerLtv: number,
-): HealthLevel {
-  if (ltv >= dangerLtv) return "DANGER";
-  if (ltv >= warnLtv) return "WARN";
-  return "OK";
-}
-
-function healthMessage(level: HealthLevel, health: LoanHealth): string {
-  const headline =
-    level === "DANGER"
-      ? "DANGER: loan health is at high risk"
-      : level === "WARN"
-        ? "WARNING: loan health needs attention"
-        : "Loan health is back to safe";
-  return [
-    headline,
-    `LTV: ${health.ltvPercent.toFixed(2)}%`,
-    `Collateral: ${health.collateralBtc} BTC`,
-    `Debt: ${health.debtMusd} MUSD`,
-    `BTC price: $${health.btcPriceUsd}`,
-    `Distance to liquidation: ${health.distanceToLiquidationPercent.toFixed(2)} percentage points`,
-    level === "OK"
-      ? "Tip: keep a buffer by adding collateral or repaying MUSD if market conditions change."
-      : "Tip: add collateral or repay MUSD to lower your LTV.",
-  ].join("\n");
-}
-
-async function notifyHealth(
-  level: HealthLevel,
-  health: LoanHealth,
-  send: ((text: string) => Promise<void>) | undefined,
-): Promise<void> {
-  const message = healthMessage(level, health);
-  if (!send) {
-    logInfo(`[dry-run]\n${message}`);
-  } else {
-    await withRetry("Telegram health alert", () => send(message));
-  }
-}
-
-async function notifyText(
-  text: string,
-  send: ((text: string) => Promise<void>) | undefined,
-  label: string,
-): Promise<void> {
-  if (!send) {
-    logInfo(`[dry-run]\n${text}`);
-  } else {
-    await withRetry(label, () => send(text));
-  }
-}
-
-function commandLevel(ltv: number): "SAFE" | "WARNING" | "DANGER" {
-  const { warnLtv, dangerLtv } = getHealthAlertConfig();
-  if (ltv >= dangerLtv) return "DANGER";
-  if (ltv >= warnLtv) return "WARNING";
-  return "SAFE";
-}
-
-function healthCommandMessage(health: LoanHealth): string {
-  return [
-    `Level: ${commandLevel(health.ltvPercent)}`,
-    `Trove active: ${health.troveActive}`,
-    `LTV: ${health.ltvPercent.toFixed(2)}%`,
-    `Collateral: ${health.collateralBtc} BTC`,
-    `Debt: ${health.debtMusd} MUSD`,
-    `BTC price: $${health.btcPriceUsd}`,
-    `Distance to liquidation: ${health.distanceToLiquidationPercent.toFixed(2)} percentage points`,
-  ].join("\n");
-}
-
-async function handleTelegramCommand(
-  update: TelegramUpdate,
-  token: string,
-  chatId: string,
-  account: Address,
-): Promise<void> {
-  const command = update.text?.trim().split(/\s+/)[0]?.split("@")[0]?.toLowerCase();
-  if (!command || !["/health", "/balance", "/status", "/help"].includes(command)) return;
-  if (!state) throw new Error("Watch state is not initialized");
-
-  let reply: string;
-  if (command === "/health") {
-    try {
-      const health = await withRetry("Telegram /health RPC", () => getLoanHealth(account));
-      reply = healthCommandMessage(health);
-    } catch (error) {
-      reply = `Could not read loan health: RPC error: ${errorSummary(error)}`;
-    }
-  } else if (command === "/balance") {
-    try {
-      const [nativeBalance, musdBalance, decimals] = await withRetry(
-        "Telegram /balance RPC",
-        async () =>
-          Promise.all([
-            publicClient.getBalance({ address: account }),
-            getMusdBalance(account),
-            getMusdDecimals(),
-          ]),
-      );
-      reply = [
-        `BTC balance: ${formatUnits(nativeBalance, 18)} BTC`,
-        `MUSD balance: ${formatUnits(musdBalance, decimals)} MUSD`,
-      ].join("\n");
-    } catch (error) {
-      reply = `Could not read balances: RPC error: ${errorSummary(error)}`;
-    }
-  } else if (command === "/status") {
-    reply = [
-      `Watching MUSD transfers and loan health for ${getAddress(account)}`,
-      `Last processed block: ${state.lastProcessedBlock}`,
-      `Health level: ${state.healthLevel ?? "OK"}`,
-      `Uptime: ${Math.floor((Date.now() - startedAt) / 1000)} seconds`,
-    ].join("\n");
-  } else {
-    reply = "Commands: /health, /balance, /status, /help";
-  }
-
-  await withRetry("Telegram command reply", () =>
-    sendTelegramMessage(token, chatId, reply),
-  );
-}
-
-async function pollTelegramCommands(
-  token: string,
-  chatId: string,
-  account: Address,
-): Promise<void> {
-  let offset = state?.telegramUpdateOffset;
+async function waitForLock(store: Store, instanceId: string): Promise<void> {
+  const backoff = new ExponentialBackoff();
   while (!stopping) {
-    let updates: TelegramUpdate[];
     try {
-      updates = await withRetry("Telegram getUpdates", () =>
-        getTelegramUpdates(token, offset, commandAbortController.signal),
-      );
+      if (await store.acquireLock(instanceId, LOCK_TTL_MS)) {
+        logInfo("Poller lock acquired.");
+        return;
+      }
+      backoff.reset();
+      await waitOrStop(5000);
     } catch {
-      if (stopping) return;
-      await delay(POLL_INTERVAL_MS);
-      continue;
+      services.failed("redis");
+      await waitOrStop(backoff.nextDelay());
     }
+  }
+}
 
-    for (const update of updates) {
-      if (stopping) return;
-      try {
-        const allowedSenderIds =
-          process.env.TELEGRAM_ALLOWED_USER_IDS?.split(",").map((id) => id.trim()) ?? [
-            chatId,
-          ];
-        if (
-          authorizeTelegramCommand(update, chatId, allowedSenderIds) &&
-          update.senderId !== undefined &&
-          !isRateLimited(update.senderId)
-        ) {
-          await handleTelegramCommand(update, token, chatId, account);
-        }
-        offset = update.updateId + 1;
-        if (state) {
-          state.telegramUpdateOffset = offset;
-          await saveState(state);
-        }
-      } catch (error) {
-        if (stopping) return;
-        if (!(error instanceof RetryFailedError)) {
-          logError(
-            `Telegram command update ${update.updateId}: ${errorSummary(error)}; update will retry`,
-          );
-        }
-        await delay(1000);
-        break;
+async function getInitialBlockNumber(): Promise<bigint> {
+  const backoff = new ExponentialBackoff();
+  while (!stopping) {
+    try {
+      const block = await publicClient.getBlockNumber();
+      services.succeeded("rpc");
+      return block;
+    } catch {
+      services.failed("rpc");
+      await waitOrStop(backoff.nextDelay());
+    }
+  }
+  return 0n;
+}
+
+function startLockRenewal(store: Store, instanceId: string): ReturnType<typeof setInterval> {
+  let lastSuccessAt = Date.now();
+  let running = false;
+  return setInterval(() => {
+    if (stopping || running) return;
+    running = true;
+    void retryLockRenewal(
+      async () => {
+        const result = await store.renewLock(instanceId, LOCK_TTL_MS);
+        return result;
+      },
+      {
+        lastSuccessAt,
+        timeoutMs: LOCK_RENEW_TIMEOUT_MS,
+        ttlMs: LOCK_TTL_MS,
+        wait: waitOrStop,
+      },
+    ).then((result) => {
+      if (result === "renewed") {
+        lastSuccessAt = Date.now();
+      } else if (result === "lost") {
+        logError("Poller lock lost; stopping polling with exit code 1.");
+        stopIfLockLost(result, requestStop, (code) => { process.exitCode = code; });
       }
-    }
-
-    function isRateLimited(senderId: number): boolean {
-      const now = Date.now();
-      const key = String(senderId);
-      const recent = (commandAttempts.get(key) ?? []).filter(
-        (timestamp) => now - timestamp < 60_000,
-      );
-      if (recent.length >= 10) {
-        commandAttempts.set(key, recent);
-        return true;
-      }
-      recent.push(now);
-      commandAttempts.set(key, recent);
-      return false;
-    }
-  }
-}
-
-async function checkLoanHealth(
-  account: Address,
-  decimals: number,
-  send: ((text: string) => Promise<void>) | undefined,
-): Promise<void> {
-  if (!state) throw new Error("Watch state is not initialized");
-  const alertConfig = getHealthAlertConfig();
-  let health: LoanHealth;
-  try {
-    health = await withRetry("Loan health RPC", () => getLoanHealth(account, decimals));
-  } catch {
-    await recordHealthFailure(send);
-    return;
-  }
-  await recordHealthSuccess(send);
-  if (simulatedLtv !== undefined) {
-    health.ltvPercent = simulatedLtv;
-    health.distanceToLiquidationPercent =
-      health.liquidationLtvPercent - simulatedLtv;
-  }
-
-  const wasInitialized =
-    simulatedHealthLevel !== undefined || state.healthLevel !== undefined;
-  const previous = simulatedHealthLevel ?? state.healthLevel ?? "OK";
-  const target = healthLevelFor(
-    health.ltvPercent,
-    alertConfig.warnLtv,
-    alertConfig.dangerLtv,
-  );
-  logInfo(
-    `Health poll: ${target} (LTV ${health.ltvPercent.toFixed(2)}%; collateral ${health.collateralBtc} BTC; debt ${health.debtMusd} MUSD)`,
-  );
-
-  let next: HealthLevel;
-  if (health.ltvPercent < alertConfig.warnLtv - 3) {
-    next = "OK";
-  } else if (target !== "OK") {
-    next = target;
-  } else if (previous !== "OK") {
-    next = "WARN";
-  } else {
-    next = "OK";
-  }
-
-  const rank = (level: HealthLevel): number =>
-    level === "OK" ? 0 : level === "WARN" ? 1 : 2;
-  if (rank(next) > rank(previous)) {
-    await notifyHealth(next, health, send);
-  } else if (previous !== "OK" && next === "OK") {
-    await notifyHealth("OK", health, send);
-  }
-
-  if (simulatedLtv !== undefined) {
-    simulatedHealthLevel = next;
-    if (next !== previous) {
-      logInfo(`Simulated health level: ${previous} -> ${next}.`);
-    }
-    return;
-  }
-
-  if (next !== state.healthLevel) {
-    state.healthLevel = next;
-    await saveState(state);
-    logInfo(
-      wasInitialized
-        ? `Health level changed: ${previous} -> ${next}.`
-        : `Initialized persisted health level to ${next}.`,
-    );
-  }
-}
-
-async function recordHealthFailure(
-  send: ((text: string) => Promise<void>) | undefined,
-): Promise<void> {
-  if (!state) return;
-  if (state.healthFailureSinceMs === undefined) {
-    state.healthFailureSinceMs = Date.now();
-    state.healthFailureAlerted = false;
-    await saveState(state);
-  }
-
-  const failedFor = Date.now() - state.healthFailureSinceMs;
-  if (failedFor < HEALTH_FAILURE_ALERT_MS || state.healthFailureAlerted) return;
-
-  state.healthFailureAlerted = true;
-  await saveState(state);
-  await notifyText(
-    "Health check is failing: RPC unreachable",
-    send,
-    "Telegram RPC-failure alert",
-  );
-}
-
-async function recordHealthSuccess(
-  send: ((text: string) => Promise<void>) | undefined,
-): Promise<void> {
-  if (!state || state.healthFailureSinceMs === undefined) return;
-  if (state.healthFailureAlerted) {
-    await notifyText(
-      "Health check recovered",
-      send,
-      "Telegram RPC-recovered alert",
-    );
-  }
-  delete state.healthFailureSinceMs;
-  delete state.healthFailureAlerted;
-  await saveState(state);
-}
-
-async function runTelegramTest(
-  account: Address,
-  ltv: number,
-): Promise<void> {
-  const { token, chatId } = getTelegramConfig();
-  const decimals = await withRetry("MUSD decimals RPC", getMusdDecimals);
-  const health = await withRetry("Loan health RPC", () =>
-    getLoanHealth(account, decimals),
-  );
-  const simulatedHealth: LoanHealth = {
-    ...health,
-    ltvPercent: ltv,
-    distanceToLiquidationPercent: health.liquidationLtvPercent - ltv,
-  };
-  const message = [
-    "TEST (simulated, not your real loan)",
-    healthMessage("DANGER", simulatedHealth),
-  ].join("\n");
-  await withRetry("Telegram test message", () =>
-    sendTelegramMessage(token, chatId, message),
-  );
-  logInfo("Sent one Telegram test alert.");
+    }).catch(() => {
+      if (!stopping) services.failed("redis");
+    }).finally(() => { running = false; });
+  }, LOCK_RENEW_INTERVAL_MS);
 }
 
 function startHealthServer(): void {
@@ -499,142 +153,442 @@ function startHealthServer(): void {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("PORT must be an integer between 1 and 65535");
   }
-
   httpServer = createServer((request, response) => {
     if (request.method !== "GET" || request.url !== "/health") {
       response.writeHead(404).end();
       return;
     }
-    response.writeHead(200, { "content-type": "application/json" }).end(
-      JSON.stringify({
-        ok: true,
-        lastBlock: state?.lastProcessedBlock.toString() ?? null,
-        level: state?.healthLevel ?? "OK",
-        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-      }),
-    );
+    const age = lastCycleAt === 0 ? 301 : Math.floor((Date.now() - lastCycleAt) / 1000);
+    const body = {
+      ok: age <= 300,
+      uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+      lastBlock: latestProcessedBlock,
+      lastCycleAgeSeconds: age,
+      services: services.snapshot(),
+    };
+    response.writeHead(body.ok ? 200 : 503, { "content-type": "application/json" }).end(JSON.stringify(body));
   });
   httpServer.requestTimeout = 10_000;
   httpServer.headersTimeout = 5_000;
   httpServer.keepAliveTimeout = 5_000;
-  httpServer.on("error", (error) => {
-    logError(`Health HTTP server: ${errorSummary(error)}`);
-  });
-  httpServer.listen(port, "0.0.0.0", () => {
-    logInfo(`Health HTTP server listening on port ${port}.`);
-  });
+  httpServer.on("error", (error) => logError(`Health HTTP server error: ${errorSummary(error)}`));
+  httpServer.listen(port, "0.0.0.0", () => logInfo(`Health HTTP server listening on port ${port}.`));
 }
 
-async function handleRange(
-  fromBlock: bigint,
-  toBlock: bigint,
-  account: Address,
-  decimals: number,
-  send: ((text: string) => Promise<void>) | undefined,
-): Promise<void> {
-  if (!state) throw new Error("Watch state is not initialized");
-  if (fromBlock > toBlock) return;
-
-  const ids = new Set(state.recentIds);
-  const logs = await withRetry("MUSD log query", () =>
-    getTransferLogs(account, fromBlock, toBlock),
-  );
-  for (const log of logs) {
-    const id = eventId(log);
-    if (ids.has(id)) continue;
-    await notify(log, account, decimals, send);
-    ids.add(id);
-    state.recentIds.push(id);
-    if (state.recentIds.length > 1000) state.recentIds.shift();
+async function initializeStore(store: Store, latestBlock: bigint): Promise<void> {
+  const subscriptions = await store.getAllSubscriptions();
+  for (const chatId of Object.keys(subscriptions)) registerChatId(chatId);
+  if (
+    Object.keys(subscriptions).length === 0 &&
+    Number(process.env.SIMULATE_RPC_OUTAGE_MS ?? 0) === 0
+  ) {
+    const legacyAddress = process.env.WATCH_ADDRESS?.trim();
+    const ownerChat = process.env.TELEGRAM_CHAT_ID?.trim();
+    if (legacyAddress && ownerChat) {
+      const address = normalizeAddress(legacyAddress);
+      await store.addSubscription(ownerChat, { address: address.toLowerCase() as Address }, limitsFromEnvironment());
+      logInfo("Migrated the configured owner subscription.");
+    }
   }
+  if (await store.getLastProcessedBlock() === undefined) {
+    await store.setLastProcessedBlock(latestBlock);
+  }
+}
 
-  state.lastProcessedBlock = toBlock;
-  await saveState(state);
-  logInfo(`Processed blocks ${fromBlock}-${toBlock}`);
+function getToken(): string {
+  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  if (!token) throw new Error("Missing required environment variable: TELEGRAM_BOT_TOKEN");
+  return token;
+}
+
+async function runTelegramTest(store: Store): Promise<void> {
+  if (DRY_RUN) throw new Error("--telegram-test sends a real message and cannot be combined with --dry-run");
+  const token = getToken();
+  const address = getWatchAddress();
+  const health = await getLoanHealth(address);
+  const message = [
+    "TEST (simulated, not your real loan)",
+    `Trove active: ${health.troveActive ? "yes" : "no"}`,
+    `LTV: ${health.ltvPercent.toFixed(2)}%`,
+  ].join("\n");
+  const queue = new OutboundQueue((chatId, text) => sendTelegramMessage(token, chatId, text), (chatId) => store.deleteChat(chatId));
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!chatId) throw new Error("--telegram-test requires TELEGRAM_CHAT_ID");
+  await queue.sendMessage(chatId, message);
+  await queue.flush();
+  await store.flush();
+  logInfo("Sent one Telegram test alert.");
+}
+
+async function runDryRunDemo(store: Store): Promise<void> {
+  const demoAddress = normalizeAddress("0x0000000000000000000000000000000000000001");
+  const demoChatId = "987654321";
+  const simulatedArg = process.argv.indexOf("--simulate-ltv");
+  const simulatedLtv = simulatedArg >= 0 ? Number(process.argv[simulatedArg + 1]) : 85;
+  const priceArg = process.argv.indexOf("--simulate-price");
+  const simulatedPrice = priceArg >= 0 ? Number(process.argv[priceArg + 1]) : undefined;
+  if (!Number.isFinite(simulatedLtv) || simulatedLtv < 0) {
+    throw new Error("--simulate-ltv requires a non-negative numeric value");
+  }
+  if (priceArg >= 0 && (!Number.isFinite(simulatedPrice) || (simulatedPrice ?? 0) <= 0)) {
+    throw new Error("--simulate-price requires a positive numeric value");
+  }
+  const baselinePrice = 100_000;
+  const price = simulatedPrice ?? baselinePrice;
+  const debtMusd = simulatedLtv * baselinePrice / 100;
+  const currentLtv = ltvAtPrice(debtMusd, 1, price) ?? 0;
+  const fakeHealth: LoanHealth = {
+    collateralBtc: 1,
+    debtMusd,
+    btcPriceUsd: price,
+    collateralValueUsd: price,
+    ltvPercent: currentLtv,
+    liquidationLtvPercent: 90,
+    distanceToLiquidationPercent: 90 - simulatedLtv,
+    troveActive: true,
+    rawValues: {
+      collateral: "1",
+      debt: String(debtMusd),
+      btcPrice: String(price),
+      decimalPrecision: "1",
+      troveStatus: 1,
+      musdDecimals: 18,
+      collateralDecimals: 18,
+      priceDecimals: 0,
+    },
+  };
+  const commands = new BotCommands({
+    store,
+    send: async (_chatId, text) => logInfo(`TEST (dry-run)\n${text}`),
+    getHealth: async () => fakeHealth,
+    getPriceStatus: async () => {
+      const sample = (await store.getPriceSamples()).at(-1);
+      return sample
+        ? `Oracle price $${sample.price.toFixed(1)} sampled ${Math.floor((Date.now() - sample.t) / 1000)} seconds ago.`
+        : "No recent oracle price sample is available.";
+    },
+    answerCallback: (callbackId, text) => answerTelegramCallback(getToken(), callbackId, text),
+  });
+  const makeUpdate = (text: string) => ({
+    updateId: 1,
+    chatId: Number(demoChatId),
+    chatType: "private",
+    senderId: Number(demoChatId),
+    senderIsBot: false,
+    text,
+  });
+  await commands.handle(makeUpdate(`/watch ${demoAddress} demo`));
+  await commands.handle(makeUpdate("/list"));
+  const settings = await store.getSettings(demoChatId);
+  const prior = { level: "SAFE" as const, troveActive: true };
+  const next = transitionLevel(currentLtv, prior, settings.monitorLtv, settings.warnLtv, settings.dangerLtv);
+  await store.setLevel(demoChatId, demoAddress, { level: next, troveActive: true, health: fakeHealth });
+  logInfo(`TEST (dry-run) Health level changed: ${prior.level} -> ${next}.`);
+  if (priceArg >= 0) {
+    const now = Date.now();
+    await store.appendPriceSample({ t: now - 60_000, price: baselinePrice }, 300);
+    await store.appendPriceSample({ t: now, price }, 300);
+    await processPriceDropAlerts(
+      store,
+      async (_chatId, text) => logInfo(`TEST (dry-run)\n${text}`),
+      [demoAddress],
+      now,
+    );
+  }
+  logInfo("Dry-run scenario complete; no RPC or Telegram requests were made.");
+}
+
+async function pollCommands(
+  token: string,
+  store: Store,
+  queue: OutboundQueue,
+  controller: AbortController,
+): Promise<void> {
+  const bot = new BotCommands({
+    store,
+    send: (chatId, text) => queue.sendMessage(chatId, text),
+    ...(process.env.ADMIN_CHAT_ID ? { adminChatId: process.env.ADMIN_CHAT_ID } : {}),
+    answerCallback: (callbackId, text) => answerTelegramCallback(token, callbackId, text),
+    getPriceStatus: async () => {
+      const sample = (await store.getPriceSamples()).at(-1);
+      if (!sample) return "No oracle price sample is available yet.";
+      const age = Math.max(0, Math.floor((Date.now() - sample.t) / 1000));
+      const maximumAge = Number(process.env.PRICE_MAX_AGE_SECONDS ?? 600);
+      return age > maximumAge
+        ? `Oracle price is stale (${age} seconds old; maximum ${maximumAge}). Price alerts are paused.`
+        : `Oracle price: $${sample.price.toFixed(1)} (${age} seconds old).`;
+    },
+    getAdminStatus: async () => {
+      const metrics = await store.getMetrics();
+      const lastBlock = await store.getLastProcessedBlock();
+      const age = lastCycleAt ? Math.floor((Date.now() - lastCycleAt) / 1000) : "not yet";
+      return [
+        `Chats: ${metrics.chatCount}`,
+        `Addresses: ${metrics.addressCount}`,
+        `Last block: ${lastBlock?.toString() ?? "not set"}`,
+        `Last health cycle age: ${age} seconds`,
+        ...serviceStatusLines(),
+        `Redis commands used: ${metrics.redisCommands}`,
+        `Uptime: ${Math.floor((Date.now() - startedAt) / 1000)} seconds`,
+        `Errors in the last hour: ${metrics.errorsLastHour}`,
+      ];
+    },
+  });
+  let offset: number | undefined;
+  let offsetLoaded = false;
+  const backoff = new ExponentialBackoff();
+  while (!stopping) {
+    try {
+      if (!offsetLoaded) {
+        offset = await store.getTelegramOffset();
+        offsetLoaded = true;
+      }
+      const updates = await getTelegramUpdates(token, offset, controller.signal);
+      offset = await processTelegramUpdates(updates, offset, async (update) => {
+        if (stopping) return;
+        await bot.handle(update);
+      }, (nextOffset) => store.setTelegramOffset(nextOffset), (nextOffset) => { offset = nextOffset; });
+      services.succeeded("telegram");
+      backoff.reset();
+    } catch (error) {
+      if (stopping) return;
+      services.failed(wasRedisFailure(error) ? "redis" : "telegram");
+      try { await store.recordError(); } catch { /* Redis status is tracked by the store wrapper. */ }
+      await waitOrStop(backoff.nextDelay());
+    }
+  }
+}
+
+async function pollTransfers(store: Store, send: MessageSender): Promise<void> {
+  const simulationMs = Number(process.env.SIMULATE_RPC_OUTAGE_MS ?? 0);
+  if (simulationMs > 0) {
+    if (Date.now() - startedAt < simulationMs) throw new Error("Simulated RPC outage");
+    return;
+  }
+  const latest = await publicClient.getBlockNumber();
+  const confirmedThrough = latest > 2n ? latest - 2n : 0n;
+  const last = await store.getLastProcessedBlock();
+  if (last === undefined) {
+    await store.setLastProcessedBlock(latest);
+    latestProcessedBlock = latest.toString();
+    return;
+  }
+  let from = last + 1n;
+  if (from > confirmedThrough) return;
+  const decimals = await getMusdDecimals();
+  while (!stopping && from <= confirmedThrough) {
+    const to = from + LOG_CHUNK_SIZE - 1n < confirmedThrough
+      ? from + LOG_CHUNK_SIZE - 1n
+      : confirmedThrough;
+    await processTransferRange(store, send, from, to, undefined, decimals);
+    from = to + 1n;
+    latestProcessedBlock = (from - 1n).toString();
+  }
+}
+
+async function poller(
+  store: Store,
+  send: MessageSender,
+  healthPollMs: number,
+): Promise<void> {
+  const sampleSeconds = Number(process.env.PRICE_SAMPLE_SECONDS ?? 300);
+  if (!Number.isInteger(sampleSeconds) || sampleSeconds < 1) {
+    throw new Error("PRICE_SAMPLE_SECONDS must be a positive integer");
+  }
+  const transferBackoff = new ExponentialBackoff();
+  const transferLoop = async () => {
+    while (!stopping) {
+      try {
+        await pollTransfers(store, send);
+        services.succeeded("rpc");
+        transferBackoff.reset();
+        await waitOrStop(10_000);
+      } catch (error) {
+        services.failed(wasRedisFailure(error) ? "redis" : "rpc");
+        try { await store.recordError(); } catch { /* Redis status is tracked by the store wrapper. */ }
+        await waitOrStop(transferBackoff.nextDelay());
+      }
+    }
+  };
+  const healthBackoff = new ExponentialBackoff();
+  const healthLoop = async () => {
+    while (!stopping) {
+      try {
+        const cycle = await runHealthCycle(store, send);
+        if (cycle.failedChecks > 0) throw new Error("One or more loan health checks failed");
+        if (cycle.totalChecks > 0) services.succeeded("rpc");
+        if (cycle.sample) {
+          const samples = await store.getPriceSamples();
+          const previous = samples.at(-1);
+          if (!previous || cycle.sample.t - previous.t >= sampleSeconds * 1000) {
+            await store.appendPriceSample(cycle.sample, 300);
+            await processPriceDropAlerts(store, send, cycle.freshAddresses, cycle.sample.t);
+          }
+        }
+        lastCycleAt = Date.now();
+        healthBackoff.reset();
+        await waitOrStop(healthPollMs);
+      } catch (error) {
+        services.failed(wasRedisFailure(error) ? "redis" : "rpc");
+        try { await store.recordError(); } catch { /* Redis status is tracked by the store wrapper. */ }
+        await waitOrStop(healthBackoff.nextDelay());
+      }
+    }
+  };
+  await Promise.all([transferLoop(), healthLoop()]);
 }
 
 async function main(): Promise<void> {
   startedAt = Date.now();
   validateEnvironment();
-  const telegramTestLtv = getTelegramTestLtv();
-  if (telegramTestLtv !== undefined) {
-    if (DRY_RUN) {
-      throw new Error("--telegram-test sends a real message and cannot be combined with --dry-run");
-    }
-    await runTelegramTest(getWatchAddress(), telegramTestLtv);
+  if (DRY_RUN && process.argv.includes("--telegram-test")) {
+    throw new Error("--telegram-test sends a real message and cannot be combined with --dry-run");
+  }
+  const baseStore = DRY_RUN ? new MemoryStore() : await createStoreResiliently();
+  const store = trackStore(baseStore);
+  if (DRY_RUN) {
+    await runDryRunDemo(store);
+    await store.flush();
     return;
   }
-
-  simulatedLtv = getSimulatedLtv();
-  if (simulatedLtv !== undefined && !DRY_RUN) {
-    throw new Error("--simulate-ltv requires --dry-run; simulated alerts are never sent to Telegram");
+  if (process.argv.includes("--telegram-test")) {
+    await runTelegramTest(store);
+    return;
   }
-  const account = getWatchAddress();
-  const healthAlertConfig = getHealthAlertConfig();
-  const telegram = DRY_RUN ? undefined : getTelegramConfig();
-  const send = telegram
-    ? (text: string) => sendTelegramMessage(telegram.token, telegram.chatId, text)
-    : undefined;
-  const decimals = await withRetry("MUSD decimals RPC", getMusdDecimals);
-  const latestBlock = await withRetry("Latest block query", () =>
-    publicClient.getBlockNumber(),
-  );
-
-  state = await loadState(latestBlock);
-  const commandPolling = telegram
-    ? pollTelegramCommands(telegram.token, telegram.chatId, account)
-    : undefined;
-  logInfo(
-    `${DRY_RUN ? "Dry run" : "Watching"} MUSD transfers for ${getAddress(account)} from block ${state.lastProcessedBlock + 1n}`,
-  );
-  if (simulatedLtv !== undefined) {
-    logInfo("Simulation mode: transfer polling and state writes are disabled.");
-    logInfo(`[simulation] Using LTV ${simulatedLtv}% for health alert decisions.`);
+  if (process.argv.includes("--simulate-ltv") || process.argv.includes("--simulate-price")) {
+    throw new Error("--simulate-ltv and --simulate-price require --dry-run; simulated alerts are never sent to Telegram");
   }
+  const { pollSeconds } = getHealthAlertConfig();
+  const token = getToken();
   startHealthServer();
-  let nextHealthPollAt = 0;
-
-  while (!stopping) {
-    if (simulatedLtv === undefined) {
-      try {
-        const latest = await withRetry("Latest block query", () =>
-          publicClient.getBlockNumber(),
-        );
-        let start = state.lastProcessedBlock + 1n;
-        while (!stopping && start <= latest) {
-          const end =
-            start + LOG_CHUNK_SIZE - 1n > latest
-              ? latest
-              : start + LOG_CHUNK_SIZE - 1n;
-          await handleRange(start, end, account, decimals, send);
-          start = end + 1n;
-        }
-      } catch {
-        if (stopping) break;
-      }
-    }
-
-    if (!stopping && Date.now() >= nextHealthPollAt) {
-      try {
-        await checkLoanHealth(account, decimals, send);
-      } catch (error) {
-        if (!(error instanceof RetryFailedError)) {
-          logError(`Health alert processing: ${errorSummary(error)}`);
-        }
-      }
-      nextHealthPollAt = Date.now() + healthAlertConfig.pollSeconds * 1000;
-    }
-    if (!stopping) await delay(POLL_INTERVAL_MS);
+  const latestBlock = Number(process.env.SIMULATE_RPC_OUTAGE_MS ?? 0) > 0
+    ? 0n
+    : await getInitialBlockNumber();
+  await initializeStoreResiliently(store, latestBlock);
+  if (stopping) return;
+  latestProcessedBlock = (await store.getLastProcessedBlock())?.toString() ?? null;
+  const instanceId = randomUUID();
+  await waitForLock(store, instanceId);
+  if (stopping) {
+    await store.releaseLock(instanceId);
+    return;
   }
-
-  if (state && simulatedLtv === undefined) await saveState(state);
-  await commandPolling;
-  logInfo("Watcher stopped cleanly.");
+  const renewal = startLockRenewal(store, instanceId);
+  const queue = outboundQueue = new OutboundQueue(
+    (chatId, text, replyMarkup) => sendTelegramMessage(token, chatId, text, replyMarkup),
+    (chatId) => store.deleteChat(chatId),
+    {
+      onFailure: () => services.failed("telegram"),
+      onSuccess: () => services.succeeded("telegram"),
+    },
+  );
+  commandController = new AbortController();
+  const commands = Number(process.env.SIMULATE_RPC_OUTAGE_MS ?? 0) > 0
+    ? Promise.resolve()
+    : pollCommands(token, store, queue, commandController);
+  try {
+    await poller(store, (chatId, message, keyboard) => queue.sendMessage(chatId, message, keyboard), pollSeconds * 1000);
+  } finally {
+    stopping = true;
+    queue.stop();
+    commandController.abort();
+    clearInterval(renewal);
+    await commands;
+    await queue.flush();
+    await store.flush();
+    await store.releaseLock(instanceId);
+    await new Promise<void>((resolve) => httpServer?.close(() => resolve()) ?? resolve());
+    logInfo("Watcher stopped cleanly.");
+  }
 }
 
-main().catch((error: unknown) => {
-  if (!(error instanceof RetryFailedError)) {
-    logError(`Watcher stopped: ${errorSummary(error)}`);
-  }
+process.on("unhandledRejection", (error: unknown) => {
+  logError(`Unhandled rejection: ${errorSummary(error)}`);
   process.exitCode = 1;
+  requestStop();
 });
+process.on("uncaughtException", (error: Error) => {
+  logError(`Uncaught exception: ${errorSummary(error)}`);
+  process.exitCode = 1;
+  requestStop();
+});
+
+main().catch((error: unknown) => {
+  logError(`Watcher stopped: ${errorSummary(error)}`);
+  process.exitCode = 1;
+  requestStop();
+});
+
+async function initializeStoreResiliently(store: Store, latestBlock: bigint): Promise<void> {
+  const backoff = new ExponentialBackoff();
+  while (!stopping) {
+    try {
+      await initializeStore(store, latestBlock);
+      if (isRedisStoreSelected()) services.succeeded("redis");
+      return;
+    } catch (error) {
+      if (!isTransientNetworkError(error)) throw error;
+      services.failed("redis");
+      await waitOrStop(backoff.nextDelay());
+    }
+  }
+}
+
+async function createStoreResiliently(): Promise<Store> {
+  const backoff = new ExponentialBackoff();
+  while (!stopping) {
+    try {
+      const store = await createStore();
+      if (isRedisStoreSelected()) services.succeeded("redis");
+      return store;
+    } catch (error) {
+      if (!isTransientNetworkError(error)) throw error;
+      services.failed("redis");
+      await waitOrStop(backoff.nextDelay());
+    }
+  }
+  throw new Error("Shutdown requested before store initialization completed");
+}
+
+function isTransientNetworkError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|fetch|network|abort|econn|enotfound|socket/i.test(message);
+}
+
+function trackStore(store: Store): Store {
+  return new Proxy(store, {
+    get(target, property, receiver) {
+      const value: unknown = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        let result: unknown;
+        try {
+          result = Reflect.apply(value, target, args);
+        } catch (error) {
+          if (isRedisStoreSelected()) services.failed("redis");
+          throw error;
+        }
+        if (!(result instanceof Promise)) return result;
+        return result.then((resolved: unknown) => {
+          if (isRedisStoreSelected()) services.succeeded("redis");
+          return resolved;
+        }).catch((error: unknown) => {
+          if (isRedisStoreSelected()) {
+            services.failed("redis");
+            if (typeof error === "object" && error !== null) redisFailures.add(error);
+          }
+          throw error;
+        });
+      };
+    },
+  });
+}
+
+function serviceStatusLines(): string[] {
+  return (Object.entries(services.snapshot()) as Array<[ServiceName, { lastSuccessAt: string | null; outage: boolean }]>)
+    .map(([service, status]) =>
+      `${service}: ${status.outage ? "outage" : status.lastSuccessAt ? "ok" : "unknown"}; last success ${status.lastSuccessAt ?? "never"}`,
+    );
+}
+
+export { initializeStore, runDryRunDemo };

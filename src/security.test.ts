@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { afterAll, test } from "vitest";
 import {
   authorizeTelegramCommand,
   redact,
+  registerChatId,
 } from "./security.js";
 
 const original = {
@@ -14,7 +15,7 @@ process.env.TELEGRAM_BOT_TOKEN = "test-bot-token-value";
 process.env.TELEGRAM_CHAT_ID = "-123456789";
 process.env.RPC_URL = "https://user:password@example.invalid/rpc";
 
-after(() => {
+afterAll(() => {
   restore("TELEGRAM_BOT_TOKEN", original.token);
   restore("TELEGRAM_CHAT_ID", original.chatId);
   restore("RPC_URL", original.rpcUrl);
@@ -41,6 +42,14 @@ test("redacts HTTPS RPC endpoint credentials and keys", () => {
   } finally {
     restore("RPC_URL", originalRpcUrl);
   }
+});
+
+test("redacts registered chat ids without redacting health values", () => {
+  registerChatId("987654321");
+  const output = redact("chat=987654321; debt=100000 MUSD; btc price=$9876543210");
+  assert.equal(output.includes("chat=[chat-id]"), true);
+  assert.equal(output.includes("100000"), true);
+  assert.equal(output.includes("9876543210"), true);
 });
 
 test("authorizes only bounded text in the target chat from an allowed sender", () => {

@@ -19,9 +19,9 @@ export const LOG_CHUNK_SIZE = 2000n;
 
 let decimalsPromise: Promise<number> | undefined;
 
-export async function getMusdDecimals(): Promise<number> {
+export async function getMusdDecimals(client = publicClient): Promise<number> {
   if (!decimalsPromise) {
-    decimalsPromise = publicClient
+    decimalsPromise = client
       .readContract({
         address: MUSD_ADDRESS,
         abi: musdAbi,
@@ -80,6 +80,30 @@ export async function getTransferLogs(
     unique.set(`${log.transactionHash}:${log.logIndex}`, log);
   }
   return [...unique.values()].sort((a, b) => {
+    const blockOrder = (a.blockNumber ?? 0n) - (b.blockNumber ?? 0n);
+    if (blockOrder !== 0n) return blockOrder < 0n ? -1 : 1;
+    return (a.logIndex ?? 0) - (b.logIndex ?? 0);
+  });
+}
+
+export async function getAllTransferLogs(
+  fromBlock: bigint,
+  toBlock: bigint,
+): Promise<Log[]> {
+  const logs: Log[] = [];
+  for (let start = fromBlock; start <= toBlock; start += LOG_CHUNK_SIZE) {
+    const end =
+      start + LOG_CHUNK_SIZE - 1n > toBlock
+        ? toBlock
+        : start + LOG_CHUNK_SIZE - 1n;
+    logs.push(...await publicClient.getLogs({
+      address: MUSD_ADDRESS,
+      event: musdAbi[2],
+      fromBlock: start,
+      toBlock: end,
+    }));
+  }
+  return logs.sort((a, b) => {
     const blockOrder = (a.blockNumber ?? 0n) - (b.blockNumber ?? 0n);
     if (blockOrder !== 0n) return blockOrder < 0n ? -1 : 1;
     return (a.logIndex ?? 0) - (b.logIndex ?? 0);

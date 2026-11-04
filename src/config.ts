@@ -36,6 +36,24 @@ function getRpcUrl(): string {
 
 export const RPC_URL = getRpcUrl();
 
+export function getTimeoutMs(name: "RPC_TIMEOUT_MS" | "TELEGRAM_TIMEOUT_MS" | "REDIS_TIMEOUT_MS"): number {
+  const defaultValue = name === "RPC_TIMEOUT_MS" ? 30_000 : name === "TELEGRAM_TIMEOUT_MS" ? 35_000 : 10_000;
+  const rawValue = name === "RPC_TIMEOUT_MS"
+    ? process.env.RPC_TIMEOUT_MS?.trim()
+    : name === "TELEGRAM_TIMEOUT_MS"
+      ? process.env.TELEGRAM_TIMEOUT_MS?.trim()
+      : process.env.REDIS_TIMEOUT_MS?.trim();
+  if (!rawValue) return defaultValue;
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive whole number`);
+  }
+  if (name === "TELEGRAM_TIMEOUT_MS" && value < 2_000) {
+    throw new Error("TELEGRAM_TIMEOUT_MS must be at least 2000 so it exceeds the long-poll timeout");
+  }
+  return value;
+}
+
 export function getWatchAddress(): Address {
   const value = process.env.WATCH_ADDRESS?.trim();
   if (!value) throw new Error("Missing required environment variable: WATCH_ADDRESS");
@@ -66,33 +84,42 @@ export function getTelegramConfig(): { token: string; chatId: string } {
 
 export interface HealthAlertConfig {
   pollSeconds: number;
+  monitorLtv: number;
   warnLtv: number;
   dangerLtv: number;
 }
 
 export function getHealthAlertConfig(): HealthAlertConfig {
   const pollSeconds = parsePositiveNumber("HEALTH_POLL_SECONDS", 60);
+  // 55 is the level where Mezo's testnet Borrow page showed the Monitor zone for my loan; the exact Mezo zone boundaries are unconfirmed.
+  const monitorLtv = parsePositiveNumber("MONITOR_LTV", 55);
   const warnLtv = parsePositiveNumber("WARN_LTV", 70);
   const dangerLtv = parsePositiveNumber("DANGER_LTV", 80);
-  if (dangerLtv <= warnLtv || dangerLtv > 100 || warnLtv > 100) {
-    throw new Error("DANGER_LTV must be greater than WARN_LTV, and both must be at most 100");
+  if (
+    !Number.isInteger(monitorLtv) || !Number.isInteger(warnLtv) || !Number.isInteger(dangerLtv) ||
+    monitorLtv < 1 || monitorLtv > 88 || monitorLtv >= warnLtv ||
+    warnLtv >= dangerLtv || dangerLtv >= 90
+  ) {
+    throw new Error("Thresholds must satisfy 1 <= MONITOR_LTV < WARN_LTV < DANGER_LTV < 90");
   }
   if (!Number.isInteger(pollSeconds)) {
     throw new Error("HEALTH_POLL_SECONDS must be a positive whole number");
   }
-  return { pollSeconds, warnLtv, dangerLtv };
+  return { pollSeconds, monitorLtv, warnLtv, dangerLtv };
 }
 
 function parsePositiveNumber(
-  name: "HEALTH_POLL_SECONDS" | "WARN_LTV" | "DANGER_LTV",
+  name: "HEALTH_POLL_SECONDS" | "MONITOR_LTV" | "WARN_LTV" | "DANGER_LTV",
   defaultValue: number,
 ): number {
   const rawValue =
     name === "HEALTH_POLL_SECONDS"
       ? process.env.HEALTH_POLL_SECONDS?.trim()
-      : name === "WARN_LTV"
-        ? process.env.WARN_LTV?.trim()
-        : process.env.DANGER_LTV?.trim();
+      : name === "MONITOR_LTV"
+        ? process.env.MONITOR_LTV?.trim()
+        : name === "WARN_LTV"
+          ? process.env.WARN_LTV?.trim()
+          : process.env.DANGER_LTV?.trim();
   if (!rawValue) return defaultValue;
   const value = Number(rawValue);
   if (!Number.isFinite(value) || value <= 0) {

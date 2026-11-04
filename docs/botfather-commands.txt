@@ -1,0 +1,21 @@
+start - Start the bot or subscribe using a shared address link
+help - Show available commands
+watch - Watch a trove address
+unwatch - Stop watching a trove address
+list - List watched addresses
+health - Show loan health
+balance - Show BTC and MUSD balances
+whatif - Estimate LTV at a BTC price
+settings - Show alert settings
+setwarn - Set the warning LTV threshold
+setdanger - Set the danger LTV threshold
+setmonitor - Set the monitor LTV threshold
+monitoralerts - Turn monitor-zone alerts on or off
+pricealerts - Turn BTC price-drop alerts on or off
+setdrop - Set the BTC price-drop alert threshold
+reminders - Turn DANGER reminders on or off
+unsnooze - Clear active alert snoozes
+status - Show oracle price freshness
+transfers - Turn MUSD transfer alerts on or off
+stop - Delete your stored data after confirmation
+admin - Show poller diagnostics

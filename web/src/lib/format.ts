@@ -1,6 +1,6 @@
 import { isAddress } from "viem";
 
-export type HealthLevel = "SAFE" | "WARNING" | "DANGER" | "NO_LOAN";
+export type HealthLevel = "SAFE" | "MONITOR" | "WARNING" | "DANGER" | "NO_LOAN";
 
 export interface HealthMetrics {
   collateralBtc: number;
@@ -53,6 +53,7 @@ export function liquidationPrice(
 
 export function classifyLevel(
   health: HealthMetrics,
+  monitorLtv: number,
   warnLtv: number,
   dangerLtv: number,
 ): HealthLevel {
@@ -60,6 +61,7 @@ export function classifyLevel(
   const ltv = calculateLtv(health.debtMusd, health.collateralBtc, health.btcPriceUsd);
   if (ltv >= dangerLtv) return "DANGER";
   if (ltv >= warnLtv) return "WARNING";
+  if (ltv >= monitorLtv) return "MONITOR";
   return "SAFE";
 }
 

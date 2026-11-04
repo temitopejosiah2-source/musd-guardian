@@ -19,8 +19,9 @@ Open `http://localhost:3000`. RPC and contract reads run server-side; no wallet 
 | --- | --- | --- | --- |
 | `RPC_URL` | No | `https://rpc.test.mezo.org` | Mezo Testnet JSON-RPC URL. Keep it server-only. |
 | `TRANSFERS_LOOKBACK_BLOCKS` | No | `6000` | Recent block range scanned for MUSD transfers (maximum `120000`). |
+| `MONITOR_LTV` | No | `55` | LTV at or above which an active loan is MONITOR. |
 | `WARN_LTV` | No | `70` | LTV at or above which a loan is WARNING. |
-| `DANGER_LTV` | No | `80` | LTV at or above which a loan is DANGER. |
+| `DANGER_LTV` | No | `80` | LTV at or above which a loan is DANGER; thresholds must satisfy monitor < warn < danger < 90. |
 | `NEXT_PUBLIC_TELEGRAM_BOT_URL` | No | — | Link to the Telegram alert bot. |
 | `NEXT_PUBLIC_REPO_URL` | No | — | Project repository URL. |
 | `UPSTASH_REDIS_REST_URL` | No | — | Server-only shared rate-limit endpoint. |

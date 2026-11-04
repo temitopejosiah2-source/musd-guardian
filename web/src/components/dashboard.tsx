@@ -1,11 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   formatAddress,
   formatNumber,
-  liquidationPrice,
   validateAddress,
   type HealthLevel,
 } from "@/lib/format";
@@ -28,6 +27,12 @@ const levelDetails: Record<
     icon: "✓",
     description: "Your loan is below the warning threshold. Keep a buffer as BTC prices move.",
     color: "safe",
+  },
+  MONITOR: {
+    title: "MONITOR",
+    icon: "◉",
+    description: "Your loan is in the monitor zone. Keep an eye on BTC price and loan changes.",
+    color: "monitor",
   },
   WARNING: {
     title: "WARNING",
@@ -72,9 +77,20 @@ function isHealthResponse(value: unknown): value is HealthResponse {
     typeof result.ltvPercent === "number" &&
     Number.isFinite(result.ltvPercent) &&
     (result.level === "SAFE" ||
+      result.level === "MONITOR" ||
       result.level === "WARNING" ||
       result.level === "DANGER" ||
       result.level === "NO_LOAN")
+    && typeof result.monitorLtv === "number"
+    && Number.isFinite(result.monitorLtv)
+    && typeof result.warnLtv === "number"
+    && Number.isFinite(result.warnLtv)
+    && typeof result.dangerLtv === "number"
+    && Number.isFinite(result.dangerLtv)
+    && (result.liquidationPriceUsd === null || (typeof result.liquidationPriceUsd === "number" && Number.isFinite(result.liquidationPriceUsd)))
+    && (result.bufferToWarnPercent === null || (typeof result.bufferToWarnPercent === "number" && Number.isFinite(result.bufferToWarnPercent)))
+    && (result.bufferToDangerPercent === null || (typeof result.bufferToDangerPercent === "number" && Number.isFinite(result.bufferToDangerPercent)))
+    && (result.bufferToLiquidationPercent === null || (typeof result.bufferToLiquidationPercent === "number" && Number.isFinite(result.bufferToLiquidationPercent)))
   );
 }
 
@@ -125,6 +141,12 @@ function staleMessage(updatedAt: string): string {
   return `Showing data from ${minutes} min ago.`;
 }
 
+function formatBufferLine(level: string, value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return `BTC price buffer to ${level}: unavailable.`;
+  if (value < 0) return `BTC is already past ${level} price by ${formatNumber(Math.abs(value), 1)}%.`;
+  return `BTC can fall ${formatNumber(value, 1)}% before ${level}.`;
+}
+
 function retryDelay(attempt: number): number | undefined {
   switch (attempt) {
     case 0:
@@ -142,6 +164,8 @@ function getLevelDetails(level: HealthLevel | null) {
   switch (level) {
     case "SAFE":
       return levelDetails.SAFE;
+    case "MONITOR":
+      return levelDetails.MONITOR;
     case "WARNING":
       return levelDetails.WARNING;
     case "DANGER":
@@ -348,17 +372,6 @@ export default function Dashboard() {
 
   const viewLevel = health?.level ?? null;
   const level = getLevelDetails(viewLevel);
-  const liquidationBtcPrice = useMemo(
-    () =>
-      health?.troveActive
-        ? liquidationPrice(
-            health.debtMusd,
-            health.collateralBtc,
-            health.liquidationLtvPercent,
-          )
-        : null,
-    [health],
-  );
 
   async function connectWallet(): Promise<void> {
     if (!window.ethereum) {
@@ -402,6 +415,9 @@ export default function Dashboard() {
   }
 
   const telegramUrl = process.env.NEXT_PUBLIC_TELEGRAM_BOT_URL;
+  const addressTelegramUrl = telegramUrl && health
+    ? `${telegramUrl.replace(/\/$/, "")}?start=w_${health.address.slice(2).toLowerCase()}`
+    : telegramUrl;
   const repoUrl = process.env.NEXT_PUBLIC_REPO_URL;
 
   return (
@@ -522,7 +538,20 @@ export default function Dashboard() {
                   viewBox="0 0 1000 52"
                   preserveAspectRatio="none"
                 >
-                  <rect x="0" y="10" width={health.warnLtv * 10} height="9" className="meter-safe-zone" />
+                  <rect
+                    x="0"
+                    y="10"
+                    width={health.monitorLtv * 10}
+                    height="9"
+                    className="meter-safe-zone"
+                  />
+                  <rect
+                    x={health.monitorLtv * 10}
+                    y="10"
+                    width={(health.warnLtv - health.monitorLtv) * 10}
+                    height="9"
+                    className="meter-monitor-zone"
+                  />
                   <rect
                     x={health.warnLtv * 10}
                     y="10"
@@ -544,11 +573,11 @@ export default function Dashboard() {
                     height="9"
                     className={`meter-fill meter-fill-${level.color}`}
                   />
-                  {[health.warnLtv, health.dangerLtv, 90].map((mark, index) => (
+                  {[health.monitorLtv, health.warnLtv, health.dangerLtv, 90].map((mark, index) => (
                     <g key={`${mark}-${index}`} className={`meter-tick meter-tick-${index}`}>
                       <line x1={mark * 10} x2={mark * 10} y1="6" y2="25" />
                       <text x={mark * 10} y="43" textAnchor="middle">
-                        {index === 0 ? "WARN" : index === 1 ? "DANGER" : "90% LIQ."}
+                        {index === 0 ? "MONITOR" : index === 1 ? "WARN" : index === 2 ? "DANGER" : "90% LIQ."}
                       </text>
                     </g>
                   ))}
@@ -564,7 +593,7 @@ export default function Dashboard() {
                 <Metric label="BTC PRICE" value={`$${formatNumber(health.btcPriceUsd, 2)}`} unit="USD" />
                 <Metric label="TO LIQUIDATION" value={health.troveActive ? `${formatNumber(health.distanceToLiquidationPercent, 2)} pp` : "—"} unit={health.troveActive ? "percentage points" : ""} />
               </div>
-              {health.troveActive && liquidationBtcPrice !== null ? (
+              {health.troveActive && health.liquidationPriceUsd !== null ? (
                 <div className="liquidation-price">
                   <div className="price-comparison-heading">
                     <span className="liquidation-icon" aria-hidden="true">⌁</span>
@@ -578,14 +607,24 @@ export default function Dashboard() {
                     <span className="price-arrow" aria-hidden="true">→</span>
                     <div className="price-point price-liquidation">
                       <small>At liquidation</small>
-                      <strong>${formatNumber(liquidationBtcPrice, 2)} <small>USD</small></strong>
+                      <strong>${formatNumber(health.liquidationPriceUsd, 2)} <small>USD</small></strong>
                     </div>
                   </div>
                 </div>
               ) : null}
+              {health.troveActive ? (
+                <div className="price-buffers" aria-label="BTC price buffers">
+                  <p>{formatBufferLine("WARNING", health.bufferToWarnPercent)}</p>
+                  <p>{formatBufferLine("DANGER", health.bufferToDangerPercent)}</p>
+                  <p>{formatBufferLine("liquidation", health.bufferToLiquidationPercent)}</p>
+                </div>
+              ) : null}
               <div className="card-foot">
                 <span>Address <code>{formatAddress(health.address)}</code></span>
-                <button type="button" className="text-button" onClick={() => void copyShareLink()}>{copied ? "Copied!" : "Share result ↗"}</button>
+                <div className="result-actions">
+                  {addressTelegramUrl ? <a className="text-button" href={addressTelegramUrl} target="_blank" rel="noopener noreferrer">Get alerts for this address on Telegram ↗</a> : null}
+                  <button type="button" className="text-button" onClick={() => void copyShareLink()}>{copied ? "Copied!" : "Share result ↗"}</button>
+                </div>
               </div>
             </article>
 
@@ -630,13 +669,13 @@ export default function Dashboard() {
         <div className="telegram-copy">
           <span className="section-kicker">STAY IN THE LOOP</span>
           <h2>Get alerts on Telegram</h2>
-          <p>Get notified when the configured loan moves into a riskier LTV range.</p>
+          <p>Anyone can subscribe to this address or use <code>/watch</code> in the bot, up to the per-chat address limit. Change alert thresholds with <code>/settings</code>. Alerts monitor Mezo TESTNET loans.</p>
           <div className="telegram-steps">
-            <span><i>1</i> Open the bot</span><span><i>2</i> Press Start</span><span><i>3</i> Send <code>/health</code></span>
+            <span><i>1</i> Open the bot</span><span><i>2</i> Press Start</span><span><i>3</i> Set thresholds with <code>/settings</code></span>
           </div>
-          <small className="subscription-note">Alerts are sent for the address the bot operator configured. Per-user subscriptions are on the roadmap.</small>
+          <small className="subscription-note">Thresholds and notifications are managed privately in your Telegram chat.</small>
         </div>
-        {telegramUrl ? <a className="button button-telegram" href={telegramUrl} target="_blank" rel="noreferrer">Open Telegram <span aria-hidden="true">↗</span></a> : <span className="telegram-not-configured">Bot link not configured</span>}
+        {addressTelegramUrl ? <a className="button button-telegram" href={addressTelegramUrl} target="_blank" rel="noopener noreferrer">{health ? "Get alerts for this address on Telegram" : "Open Telegram"} <span aria-hidden="true">↗</span></a> : <span className="telegram-not-configured">Bot link not configured</span>}
       </section>
 
       <footer className="footer">

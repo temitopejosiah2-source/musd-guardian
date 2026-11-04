@@ -1,6 +1,6 @@
 import { formatUnits, parseAbi, type Address } from "viem";
 import { chain, PRICE_FEED_ADDRESS, TROVE_MANAGER_ADDRESS } from "./config.js";
-import { publicClient } from "./client.js";
+import { healthClient } from "./client.js";
 import { getMusdDecimals } from "./musd.js";
 
 export const LIQUIDATION_LTV_PERCENT = 90;
@@ -68,35 +68,35 @@ export async function getLoanHealth(
     precision,
     musdDecimals,
   ] = await Promise.all([
-    publicClient.readContract({
+    healthClient.readContract({
       address: TROVE_MANAGER_ADDRESS,
       abi: troveManagerAbi,
       functionName: "getTroveColl",
       args: [borrower],
     }),
-    publicClient.readContract({
+    healthClient.readContract({
       address: TROVE_MANAGER_ADDRESS,
       abi: troveManagerAbi,
       functionName: "getTroveDebt",
       args: [borrower],
     }),
-    publicClient.readContract({
+    healthClient.readContract({
       address: TROVE_MANAGER_ADDRESS,
       abi: troveManagerAbi,
       functionName: "getTroveStatus",
       args: [borrower],
     }),
-    publicClient.readContract({
+    healthClient.readContract({
       address: PRICE_FEED_ADDRESS,
       abi: priceFeedAbi,
       functionName: "fetchPrice",
     }),
-    publicClient.readContract({
+    healthClient.readContract({
       address: TROVE_MANAGER_ADDRESS,
       abi: troveManagerAbi,
       functionName: "DECIMAL_PRECISION",
     }),
-    cachedMusdDecimals === undefined ? getMusdDecimals() : cachedMusdDecimals,
+    cachedMusdDecimals === undefined ? getMusdDecimals(healthClient) : cachedMusdDecimals,
   ]);
 
   const collateralDecimals = chain.nativeCurrency.decimals;

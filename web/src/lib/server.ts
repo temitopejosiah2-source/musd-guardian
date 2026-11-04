@@ -8,6 +8,7 @@ import {
 } from "viem";
 import { decodeEventLog, formatUnits, getAddress } from "viem";
 import type { HealthLevel } from "./format";
+import { bufferPercent, priceAtLtv } from "./risk";
 import { getRequestSignal } from "./request-budget";
 
 export const EXPLORER_URL = "https://explorer.test.mezo.org";
@@ -148,8 +149,13 @@ export interface HealthResponse {
   liquidationLtvPercent: 90;
   distanceToLiquidationPercent: number;
   level: HealthLevel;
+  monitorLtv: number;
   warnLtv: number;
   dangerLtv: number;
+  liquidationPriceUsd: number | null;
+  bufferToWarnPercent: number | null;
+  bufferToDangerPercent: number | null;
+  bufferToLiquidationPercent: number | null;
   updatedAt: string;
   stale?: boolean;
 }
@@ -205,25 +211,28 @@ function setCache<T>(
   cache.set(key, { expiresAt: now + lifetimeMs, value });
 }
 
-function getThresholds(): { warn: number; danger: number } {
+function getThresholds(): { monitor: number; warn: number; danger: number } {
   const parseThreshold = (
-    key: "WARN_LTV" | "DANGER_LTV",
+    key: "MONITOR_LTV" | "WARN_LTV" | "DANGER_LTV",
     fallback: number,
   ): number => {
-    const raw =
-      key === "WARN_LTV"
+    const raw = key === "MONITOR_LTV"
+      ? process.env.MONITOR_LTV?.trim()
+      : key === "WARN_LTV"
         ? process.env.WARN_LTV?.trim()
         : process.env.DANGER_LTV?.trim();
     const value = raw ? Number(raw) : fallback;
-    if (!Number.isFinite(value) || value <= 0 || value > 100) {
+    if (!Number.isInteger(value) || value <= 0 || value >= 90) {
       throw new Error("Invalid health threshold configuration");
     }
     return value;
   };
+  // Keep the dashboard thresholds aligned with the bot's MONITOR_LTV default.
+  const monitor = parseThreshold("MONITOR_LTV", 55);
   const warn = parseThreshold("WARN_LTV", 70);
   const danger = parseThreshold("DANGER_LTV", 80);
-  if (danger <= warn) throw new Error("Invalid health threshold configuration");
-  return { warn, danger };
+  if (!(monitor < warn && warn < danger)) throw new Error("Invalid health threshold configuration");
+  return { monitor, warn, danger };
 }
 
 function decimalPlaces(precision: bigint): number {
@@ -256,9 +265,10 @@ function getMusdDecimals(): Promise<number> {
 
 function levelFor(ltv: number, active: boolean): HealthLevel {
   if (!active) return "NO_LOAN";
-  const { warn, danger } = getThresholds();
+  const { monitor, warn, danger } = getThresholds();
   if (ltv >= danger) return "DANGER";
   if (ltv >= warn) return "WARNING";
+  if (ltv >= monitor) return "MONITOR";
   return "SAFE";
 }
 
@@ -307,6 +317,10 @@ async function fetchHealth(address: Address): Promise<HealthResponse> {
         ? (debtMusd / collateralValueUsd) * 100
         : 0;
 
+    const thresholds = getThresholds();
+    const liquidationPriceUsd = troveActive ? priceAtLtv(debtMusd, collateralBtc, 90) : null;
+    const warnPrice = troveActive ? priceAtLtv(debtMusd, collateralBtc, thresholds.warn) : null;
+    const dangerPrice = troveActive ? priceAtLtv(debtMusd, collateralBtc, thresholds.danger) : null;
     return {
       address,
       troveActive,
@@ -318,8 +332,13 @@ async function fetchHealth(address: Address): Promise<HealthResponse> {
       liquidationLtvPercent: 90,
       distanceToLiquidationPercent: 90 - ltvPercent,
       level: levelFor(ltvPercent, troveActive),
-      warnLtv: getThresholds().warn,
-      dangerLtv: getThresholds().danger,
+      monitorLtv: thresholds.monitor,
+      warnLtv: thresholds.warn,
+      dangerLtv: thresholds.danger,
+      liquidationPriceUsd,
+      bufferToWarnPercent: warnPrice === null ? null : bufferPercent(btcPriceUsd, warnPrice),
+      bufferToDangerPercent: dangerPrice === null ? null : bufferPercent(btcPriceUsd, dangerPrice),
+      bufferToLiquidationPercent: liquidationPriceUsd === null ? null : bufferPercent(btcPriceUsd, liquidationPriceUsd),
       updatedAt: new Date().toISOString(),
     };
   } catch {

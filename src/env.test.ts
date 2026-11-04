@@ -1,23 +1,33 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { afterAll, test } from "vitest";
 import { validateEnvironment } from "./env.js";
 
 const names = [
   "WATCH_ADDRESS",
   "RPC_URL",
+  "RPC_TIMEOUT_MS",
+  "TELEGRAM_TIMEOUT_MS",
+  "REDIS_TIMEOUT_MS",
+  "SIMULATE_RPC_OUTAGE_MS",
   "TELEGRAM_BOT_TOKEN",
   "TELEGRAM_CHAT_ID",
   "TELEGRAM_ALLOWED_USER_IDS",
   "START_LOOKBACK_BLOCKS",
   "HEALTH_POLL_SECONDS",
+  "MONITOR_LTV",
   "WARN_LTV",
   "DANGER_LTV",
+  "PRICE_SAMPLE_SECONDS",
+  "PRICE_ALERT_COOLDOWN_MINUTES",
+  "PRICE_MAX_AGE_SECONDS",
+  "REMIND_DANGER_MINUTES",
+  "REMIND_MAX",
   "PORT",
   "STATE_PATH",
 ] as const;
 const original = new Map(names.map((name) => [name, Reflect.get(process.env, name)]));
 
-after(() => {
+afterAll(() => {
   for (const [name, value] of original) {
     // Keys in this map come only from the fixed environment-variable list above.
     if (value === undefined) Reflect.deleteProperty(process.env, name);
@@ -55,4 +65,12 @@ test("environment validation rejects non-HTTPS RPC endpoints without echoing the
       return true;
     },
   );
+});
+
+test("environment validation enforces ordered thresholds below liquidation", () => {
+  for (const name of names) Reflect.deleteProperty(process.env, name);
+  process.env.MONITOR_LTV = "70";
+  process.env.WARN_LTV = "70";
+  process.env.DANGER_LTV = "90";
+  assert.throws(validateEnvironment, /MONITOR_LTV/);
 });

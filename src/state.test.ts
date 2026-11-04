@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { after, test } from "node:test";
+import { afterAll, test } from "vitest";
 import { loadState, saveState } from "./state.js";
 
 /* eslint security/detect-non-literal-fs-filename: "off" -- These paths are fixed test files scoped by the current process ID. */
@@ -8,7 +8,7 @@ const statePath = `.state-recovery-${process.pid}.json`;
 const previousPath = process.env.STATE_PATH;
 process.env.STATE_PATH = statePath;
 
-after(async () => {
+afterAll(async () => {
   if (previousPath === undefined) delete process.env.STATE_PATH;
   else process.env.STATE_PATH = previousPath;
   await Promise.all(

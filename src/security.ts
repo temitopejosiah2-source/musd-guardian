@@ -1,17 +1,36 @@
 const MAX_LOG_LENGTH = 1000;
+const registeredChatIds = new Set<string>();
+
+export function registerChatId(chatId: string): void {
+  if (!/^-?\d{1,20}$/.test(chatId)) return;
+  registeredChatIds.add(chatId);
+  if (registeredChatIds.size > 2000) {
+    const oldest = registeredChatIds.values().next().value;
+    if (oldest !== undefined) registeredChatIds.delete(oldest);
+  }
+}
 
 export function redact(value: unknown): string {
   let text = value instanceof Error ? value.message : String(value);
   const rpcUrl = process.env.RPC_URL;
   const secrets = [
     process.env.TELEGRAM_BOT_TOKEN,
-    process.env.TELEGRAM_CHAT_ID,
-    process.env.TELEGRAM_ALLOWED_USER_IDS,
-    rpcUrl,
+    process.env.UPSTASH_REDIS_REST_TOKEN,
+    process.env.UPSTASH_REDIS_REST_URL,
+    rpcUrl || "https://rpc.test.mezo.org",
   ].filter((secret): secret is string => Boolean(secret?.trim()));
 
   for (const secret of secrets) {
     text = text.replaceAll(secret, "[redacted]");
+  }
+  const chatIds = [
+    ...registeredChatIds,
+    ...(process.env.TELEGRAM_CHAT_ID ? [process.env.TELEGRAM_CHAT_ID] : []),
+    ...(process.env.TELEGRAM_ALLOWED_USER_IDS?.split(",").map((id) => id.trim()) ?? []),
+  ];
+  for (const chatId of chatIds) {
+    if (!/^-?\d{1,20}$/.test(chatId)) continue;
+    text = redactChatId(text, chatId);
   }
   if (rpcUrl) {
     try {
@@ -27,6 +46,28 @@ export function redact(value: unknown): string {
     } catch {
       // Environment validation reports malformed endpoints without logging their values.
     }
+  }
+
+  function redactChatId(text: string, chatId: string): string {
+    let output = "";
+    let cursor = 0;
+    let searchFrom = 0;
+    while (searchFrom < text.length) {
+      const index = text.indexOf(chatId, searchFrom);
+      if (index < 0) break;
+      const before = index > 0 ? text.charAt(index - 1) : "";
+      const after = text.charAt(index + chatId.length);
+      const beforeIsDigit = before >= "0" && before <= "9";
+      const afterIsDigit = after >= "0" && after <= "9";
+      if (beforeIsDigit || afterIsDigit) {
+        searchFrom = index + chatId.length;
+        continue;
+      }
+      output += `${text.slice(cursor, index)}[chat-id]`;
+      cursor = index + chatId.length;
+      searchFrom = cursor;
+    }
+    return output + text.slice(cursor);
   }
 
   return text

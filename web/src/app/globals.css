@@ -109,6 +109,7 @@ button:focus-visible, a:focus-visible, input:focus-visible {
 .result-actions { display: flex; align-items: center; gap: 9px; }
 .level-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid currentColor; border-radius: 99px; font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .4px; white-space: nowrap; }
 .level-pill-safe { color: var(--green); background: color-mix(in srgb, var(--green), transparent 93%); }
+.level-pill-monitor { color: #d7b94b; background: color-mix(in srgb, #d7b94b, transparent 93%); }
 .level-pill-warning { color: var(--amber); background: color-mix(in srgb, var(--amber), transparent 93%); }
 .level-pill-danger { color: var(--red); background: color-mix(in srgb, var(--red), transparent 93%); }
 .level-pill-neutral { color: var(--muted); background: var(--surface-soft); }
@@ -119,16 +120,21 @@ button:focus-visible, a:focus-visible, input:focus-visible {
 .metric-caption { margin-top: 7px; color: var(--faint); font-family: var(--mono); font-size: 9px; letter-spacing: 1px; }
 .level-description { max-width: 250px; margin: 0 0 3px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .description-safe > span { color: var(--green); }
+.description-monitor > span { color: #d7b94b; }
 .description-warning > span { color: var(--amber); }
 .description-danger > span { color: var(--red); }
 .ltv-meter { display: block; width: 100%; height: 54px; overflow: visible; margin: 30px 3px 0; }
 .meter-safe-zone { fill: color-mix(in srgb, var(--green), transparent 66%); }
+.meter-monitor-zone { fill: color-mix(in srgb, #d7b94b, transparent 62%); }
 .meter-warning-zone { fill: color-mix(in srgb, var(--amber), transparent 62%); }
 .meter-danger-zone { fill: color-mix(in srgb, var(--red), transparent 65%); }
 .meter-fill { rx: 4px; transition: width .5s ease; }
 .meter-fill-safe { fill: var(--green); }
+.meter-fill-monitor { fill: #d7b94b; }
 .meter-fill-warning { fill: var(--amber); }
 .meter-fill-danger { fill: var(--red); }
+.price-buffers { margin: 15px 0 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-soft); }
+.price-buffers p { margin: 3px 0; color: var(--muted); font-size: 11px; }
 .meter-tick line { stroke: var(--text); stroke-width: 2; }
 .meter-tick-0 line { stroke: var(--amber); }
 .meter-tick-1 line { stroke: var(--red); }
