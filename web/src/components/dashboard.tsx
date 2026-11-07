@@ -9,11 +9,12 @@ import {
   type HealthLevel,
 } from "@/lib/format";
 import type { HealthResponse, TransferItem, TransfersResponse } from "@/lib/server";
+import ProtectPanel from "@/components/protect-panel";
 
 declare global {
   interface Window {
     ethereum?: {
-      request(args: { method: string }): Promise<unknown>;
+      request(args: { method: string; params?: unknown[] }): Promise<unknown>;
     };
   }
 }
@@ -618,6 +619,9 @@ export default function Dashboard() {
                   <p>{formatBufferLine("DANGER", health.bufferToDangerPercent)}</p>
                   <p>{formatBufferLine("liquidation", health.bufferToLiquidationPercent)}</p>
                 </div>
+              ) : null}
+              {health.troveActive ? (
+                <ProtectPanel health={health} onRefresh={() => { void fetchAddress(address); }} />
               ) : null}
               <div className="card-foot">
                 <span>Address <code>{formatAddress(health.address)}</code></span>

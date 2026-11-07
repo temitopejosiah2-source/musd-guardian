@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterAll, test } from "vitest";
+import { afterAll, beforeEach, test } from "vitest";
 import {
   authorizeTelegramCommand,
   redact,
@@ -19,6 +19,12 @@ afterAll(() => {
   restore("TELEGRAM_BOT_TOKEN", original.token);
   restore("TELEGRAM_CHAT_ID", original.chatId);
   restore("RPC_URL", original.rpcUrl);
+});
+
+beforeEach(() => {
+  process.env.TELEGRAM_BOT_TOKEN = "test-bot-token-value";
+  process.env.TELEGRAM_CHAT_ID = "-123456789";
+  process.env.RPC_URL = "https://rpc.example.invalid/rpc";
 });
 
 test("redacts Telegram credentials and RPC endpoint credentials", () => {

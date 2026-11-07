@@ -74,22 +74,26 @@ export async function checkApiRequest(
     };
   }
 
+  const rateLimitResponse = await checkApiRateLimit(request);
+  if (rateLimitResponse) return { response: rateLimitResponse };
+  return { address: getAddress(parsed.data.address) };
+}
+
+export async function checkApiRateLimit(request: Request): Promise<Response | null> {
   const ip = extractIp(request);
   try {
     const limit = await checkRateLimit(ip ?? "unknown");
     if (limit.limited) {
-      return {
-        response: jsonError(
-          "Too many requests. Please wait before trying again.",
-          429,
-          limit.retryAfterSeconds,
-        ),
-      };
+      return jsonError(
+        "Too many requests. Please wait before trying again.",
+        429,
+        limit.retryAfterSeconds,
+      );
     }
   } catch {
-    return { response: jsonError("Request could not be processed.", 503) };
+    return jsonError("Request could not be processed.", 503);
   }
-  return { address: getAddress(parsed.data.address) };
+  return null;
 }
 
 export function rpcErrorResponse(): Response {

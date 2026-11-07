@@ -12,13 +12,40 @@ const SENT_KEY_PREFIX = "musd-guardian:v1:sent:";
 const CACHE_REFRESH_MS = 60_000;
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 
+interface RedisPipeline {
+  set(key: string, value: string): RedisPipeline;
+  del(...keys: string[]): RedisPipeline;
+  exec(): Promise<unknown>;
+}
+
+interface RedisStoreClient {
+  get<T>(key: string): Promise<T | null>;
+  pipeline(): RedisPipeline;
+  keys(pattern: string): Promise<string[]>;
+  set(
+    key: string,
+    value: string,
+    options?: { nx?: boolean; ex?: number; px?: number },
+  ): Promise<string | null>;
+  del(...keys: string[]): Promise<number>;
+  eval<TArgs extends string[], TResult>(
+    script: string,
+    keys: string[],
+    args: TArgs,
+  ): Promise<TResult>;
+}
+
 export class UpstashStore extends MemoryStore {
-  private readonly redis: Redis;
+  private readonly redis: RedisStoreClient;
   private lastRefresh = 0;
   private writes = Promise.resolve();
   private localErrors: number[] = [];
 
-  constructor(redis = Redis.fromEnv({ signal: () => AbortSignal.timeout(getTimeoutMs("REDIS_TIMEOUT_MS")) })) {
+  constructor(
+    redis: RedisStoreClient = Redis.fromEnv({
+      signal: () => AbortSignal.timeout(getTimeoutMs("REDIS_TIMEOUT_MS")),
+    }),
+  ) {
     super();
     this.redis = redis;
   }

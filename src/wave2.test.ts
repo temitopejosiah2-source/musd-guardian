@@ -17,6 +17,7 @@ import { MUSD_ADDRESS } from "./config.js";
 import { CommandRateLimiter } from "./rate-limit.js";
 import { FileStore } from "./store/file.js";
 import { MemoryStore } from "./store/memory.js";
+import { UpstashStore } from "./store/redis.js";
 import { normalizeAddress, validateLabel } from "./store/validation.js";
 import { musdAbi } from "./musd.js";
 import type { LoanHealth } from "./loan.js";
@@ -27,9 +28,131 @@ import { TelegramApiError, type TelegramUpdate } from "./telegram.js";
 const address = "0x0000000000000000000000000000000000000001" as const;
 const chatId = "987654321";
 const limits: StoreLimits = { maxAddressesPerChat: 1, maxChats: 2, maxTotalAddresses: 2 };
+interface FakeRedisEntry {
+  value: string;
+  expiresAt?: number;
+}
+
+class FakeUpstashClient {
+  private readonly values = new Map<string, FakeRedisEntry>();
+  private clockOffset = 0;
+  lastSetOptions: { nx?: boolean; ex?: number; px?: number } | undefined;
+
+  advance(milliseconds: number): void {
+    this.clockOffset += milliseconds;
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    this.removeExpired(key);
+    const entry = this.values.get(key);
+    if (!entry) return null;
+    return (entry.value as T);
+  }
+
+  pipeline() {
+    const commands: Array<{ kind: "set"; key: string; value: string } | { kind: "del"; keys: string[] }> = [];
+    const pipeline = {
+      set: (key: string, value: string) => {
+        commands.push({ kind: "set", key, value });
+        return pipeline;
+      },
+      del: (...keys: string[]) => {
+        commands.push({ kind: "del", keys });
+        return pipeline;
+      },
+      exec: async () => {
+        for (const command of commands) {
+          if (command.kind === "set") this.write(command.key, command.value);
+          else for (const key of command.keys) this.values.delete(key);
+        }
+        return [];
+      },
+    };
+    return pipeline;
+  }
+
+  async keys(pattern: string): Promise<string[]> {
+    const wildcard = pattern.indexOf("*");
+    const prefix = wildcard < 0 ? pattern : pattern.slice(0, wildcard);
+    const suffix = wildcard < 0 ? "" : pattern.slice(wildcard + 1);
+    for (const key of this.values.keys()) this.removeExpired(key);
+    return [...this.values.keys()].filter((key) => key.startsWith(prefix) && key.endsWith(suffix));
+  }
+
+  async set(
+    key: string,
+    value: string,
+    options?: { nx?: boolean; ex?: number; px?: number },
+  ): Promise<string | null> {
+    this.lastSetOptions = options;
+    this.removeExpired(key);
+    if (options?.nx && this.values.has(key)) return null;
+    this.write(
+      key,
+      value,
+      options?.ex === undefined ? options?.px : options.ex * 1000,
+    );
+    return "OK";
+  }
+
+  async del(...keys: string[]): Promise<number> {
+    let removed = 0;
+    for (const key of keys) removed += Number(this.values.delete(key));
+    return removed;
+  }
+
+  async eval<TArgs extends string[], TResult>(
+    script: string,
+    keys: string[],
+    args: TArgs,
+  ): Promise<TResult> {
+    const key = keys[0]!;
+    this.removeExpired(key);
+    const entry = this.values.get(key);
+    let result: number;
+    if (script.includes("pexpire")) {
+      if (!entry) result = 0;
+      else if (entry.value !== args[0]) result = 2;
+      else {
+        entry.expiresAt = this.clock + Number(args[1]);
+        result = 1;
+      }
+    } else {
+      result = entry?.value === args[0] ? Number(this.values.delete(key)) : 0;
+    }
+    return result as TResult;
+  }
+
+  private write(key: string, value: string, ttlMs?: number): void {
+    this.values.set(key, {
+      value,
+      ...(ttlMs === undefined ? {} : { expiresAt: this.clock + ttlMs }),
+    });
+  }
+
+  private removeExpired(key: string): void {
+    const entry = this.values.get(key);
+    if (entry?.expiresAt !== undefined && entry.expiresAt <= this.clock) this.values.delete(key);
+  }
+
+  private get clock(): number {
+    return Date.now() + this.clockOffset;
+  }
+}
+
+async function openRedisStore(client: FakeUpstashClient): Promise<UpstashStore> {
+  const store = new UpstashStore(client);
+  await store.initialize();
+  return store;
+}
+
 async function withStore(name: string, exercise: (store: Store) => Promise<void>): Promise<void> {
   if (name === "memory") {
     await exercise(new MemoryStore());
+    return;
+  }
+  if (name === "redis") {
+    await exercise(await openRedisStore(new FakeUpstashClient()));
     return;
   }
   const directory = await mkdtemp(join(tmpdir(), "musd-guardian-store-"));
@@ -41,7 +164,7 @@ async function withStore(name: string, exercise: (store: Store) => Promise<void>
 }
 
 describe("Store contract", () => {
-  it.each(["memory", "file"])("$name persists subscriptions, settings, offsets and dedupe", async (name) => {
+  it.each(["memory", "file", "redis"])("%s persists subscriptions, settings, offsets and dedupe", async (name) => {
     await withStore(name, async (store) => {
     await store.addSubscription(chatId, { address, label: "vault 1" }, limits);
     expect(await store.getSubscriptions(chatId)).toEqual([{ address, label: "vault 1" }]);
@@ -63,7 +186,7 @@ describe("Store contract", () => {
     });
   });
 
-  it.each(["memory", "file"])("$name locks, removes addresses, and deletes chat data", async (name) => {
+  it.each(["memory", "file", "redis"])("%s locks, removes addresses, and deletes chat data", async (name) => {
     await withStore(name, async (store) => {
     expect(await store.acquireLock("instance-a", 60_000)).toBe(true);
     expect(await store.acquireLock("instance-b", 60_000)).toBe(false);
@@ -83,6 +206,35 @@ describe("Store contract", () => {
     });
   }, 15_000);
 
+  it("uses Redis NX and the requested TTL for sent-key deduplication", async () => {
+    const client = new FakeUpstashClient();
+    const store = await openRedisStore(client);
+    const key = `0x${"b".repeat(64)}:2:${chatId}`;
+
+    expect(await store.markSent(key, 2)).toBe(true);
+    expect(client.lastSetOptions).toEqual({ nx: true, ex: 2 });
+    expect(await store.markSent(key, 2)).toBe(false);
+    client.advance(2_000);
+    expect(await store.markSent(key, 2)).toBe(true);
+  });
+
+  it("restores Redis subscriptions, settings, and offsets after a restart", async () => {
+    const client = new FakeUpstashClient();
+    const store = await openRedisStore(client);
+    await store.addSubscription(chatId, { address, label: "vault 1" }, limits);
+    const settings = await store.getSettings(chatId);
+    await store.setSettings(chatId, { ...settings, monitorLtv: 51 });
+    await store.setLastProcessedBlock(42n);
+    await store.setTelegramOffset(9);
+    await store.flush();
+
+    const restarted = await openRedisStore(client);
+    expect(await restarted.getSubscriptions(chatId)).toEqual([{ address, label: "vault 1" }]);
+    expect((await restarted.getSettings(chatId)).monitorLtv).toBe(51);
+    expect(await restarted.getLastProcessedBlock()).toBe(42n);
+    expect(await restarted.getTelegramOffset()).toBe(9);
+  });
+
   it("enforces chat and unique-address limits", async () => {
     const store = new MemoryStore();
     const first = "0x0000000000000000000000000000000000000001" as const;
@@ -94,11 +246,20 @@ describe("Store contract", () => {
     await expect(store.addSubscription("11", { address: second }, capped)).rejects.toThrow("Total address limit reached");
   });
 
-  it.each(["memory", "file"])("$name recovers from an expired lock without releasing the new owner", async (name) => {
+  it.each(["memory", "file", "redis"])("%s recovers from an expired lock without releasing the new owner", async (name) => {
     const directory = await mkdtemp(join(tmpdir(), "musd-guardian-lock-"));
     try {
-      const first = name === "memory" ? new MemoryStore() : await FileStore.open(join(directory, "state.json"));
-      const second = name === "memory" ? new MemoryStore() : await FileStore.open(join(directory, "state.json"));
+      const redis = new FakeUpstashClient();
+      const first = name === "memory"
+        ? new MemoryStore()
+        : name === "redis"
+          ? await openRedisStore(redis)
+          : await FileStore.open(join(directory, "state.json"));
+      const second = name === "memory"
+        ? new MemoryStore()
+        : name === "redis"
+          ? await openRedisStore(redis)
+          : await FileStore.open(join(directory, "state.json"));
       expect(await first.acquireLock("first", 20)).toBe(true);
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(await first.renewLock("first", 1000)).toBe("unavailable");
@@ -197,6 +358,23 @@ describe("multi-user commands", () => {
     expect(await store.getLevel("12345", address)).toBeUndefined();
     expect(await store.markSent(sentKey)).toBe(true);
     expect(messages.at(-1)).toContain("deleted");
+  });
+
+  it("estimates LTV at a supplied BTC price", async () => {
+    const store = new MemoryStore();
+    const messages: string[] = [];
+    await store.addSubscription("12345", { address }, limits);
+    const bot = new BotCommands({
+      store,
+      send: async (_chat, text) => { messages.push(text); },
+      getHealth: async () => fakeHealth(),
+    });
+
+    await bot.handle(update(`/whatif 50000 ${address}`));
+
+    expect(messages[0]).toContain("At BTC price $50000.00:");
+    expect(messages[0]).toContain("LTV:");
+    expect(messages[0]).toContain("Distance to liquidation:");
   });
 
   it("accepts a watched address with no active trove", async () => {

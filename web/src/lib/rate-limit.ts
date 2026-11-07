@@ -4,6 +4,9 @@ import { Redis } from "@upstash/redis";
 const WINDOW_MS = 60_000;
 const MAX_REQUESTS = 30;
 const MAX_TRACKED_IPS = 10_000;
+const UPSTASH_TIMEOUT_MS = 1_500;
+const WARNING_INTERVAL_MS = 60_000;
+const FALLBACK_WARNING = "Upstash API rate limiter unavailable; using in-memory limiting for this request.";
 
 export interface RateLimitResult {
   limited: boolean;
@@ -51,7 +54,9 @@ function getRedisLimiter(): Ratelimit | null {
   if (!url || !token) throw new Error("Rate-limit configuration is incomplete");
   if (!redisLimiter) {
     redisLimiter = new Ratelimit({
-      redis: Redis.fromEnv(),
+      redis: Redis.fromEnv({
+        signal: () => AbortSignal.timeout(UPSTASH_TIMEOUT_MS),
+      }),
       limiter: Ratelimit.slidingWindow(MAX_REQUESTS, "1 m"),
       prefix: "musd-guardian:api",
     });
@@ -59,14 +64,57 @@ function getRedisLimiter(): Ratelimit | null {
   return redisLimiter;
 }
 
-export async function checkRateLimit(ip: string): Promise<RateLimitResult> {
-  const limiter = getRedisLimiter();
-  if (!limiter) return inMemoryLimit(ip);
-  const result = await limiter.limit(ip);
-  return {
-    limited: !result.success,
-    retryAfterSeconds: result.success
-      ? 0
-      : Math.max(1, Math.ceil((result.reset - Date.now()) / 1000)),
+interface RateLimitBackend {
+  limit(key: string): Promise<{ success: boolean; reset: number }>;
+}
+
+export function createRateLimitChecker(
+  getBackend: () => RateLimitBackend | null,
+  fallback: (key: string) => RateLimitResult = inMemoryLimit,
+  now: () => number = Date.now,
+  warn: (message: string) => void = (message) => console.warn(message),
+): (key: string) => Promise<RateLimitResult> {
+  let lastWarningAt: number | undefined;
+
+  function warnOncePerMinute(): void {
+    const timestamp = now();
+    if (lastWarningAt === undefined || timestamp - lastWarningAt >= WARNING_INTERVAL_MS) {
+      lastWarningAt = timestamp;
+      warn(FALLBACK_WARNING);
+    }
+  }
+
+  return async (key) => {
+    let backend: RateLimitBackend | null;
+    try {
+      backend = getBackend();
+    } catch {
+      warnOncePerMinute();
+      return fallback(key);
+    }
+    if (!backend) return fallback(key);
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        backend.limit(key),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Rate-limit backend timed out")), UPSTASH_TIMEOUT_MS);
+        }),
+      ]);
+      return {
+        limited: !result.success,
+        retryAfterSeconds: result.success
+          ? 0
+          : Math.max(1, Math.ceil((result.reset - now()) / 1000)),
+      };
+    } catch {
+      warnOncePerMinute();
+      return fallback(key);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   };
 }
+
+export const checkRateLimit = createRateLimitChecker(getRedisLimiter);

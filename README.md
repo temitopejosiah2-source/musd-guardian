@@ -1,8 +1,8 @@
 # MUSD Guardian
 
-Read-only alerts and a dashboard for public MUSD activity on Mezo Testnet.
-The watcher and dashboard query public blockchain data; they do not hold
-private keys, sign transactions, or send transactions.
+Alerts and a dashboard for public MUSD activity on Mezo Testnet. Monitoring is
+read-only. The dashboard can build and simulate a loan-protection plan, but
+only the user's wallet signs and sends a transaction.
 
 ## Run the watcher
 
@@ -29,24 +29,34 @@ process startup for the specified number of milliseconds.
 The container uses a pinned slim Node image and runs as a non-root user. See
 [docs/DEPLOY.md](./docs/DEPLOY.md) for hosting configuration.
 
-## Wave 2: what changed
+## Wave 2: what changed since Wave 1
 
-- Four per-chat health levels are supported: SAFE, MONITOR, WARNING, and
-  DANGER, with ordered thresholds and three-point hysteresis. MONITOR messages
-  are optional; WARNING and DANGER alerts include price buffers and inline
-  check/snooze buttons.
-- The bot samples the Mezo oracle price, sends configurable BTC price-drop
-  alerts only for active watched troves, and supports persisted DANGER
-  reminders and snoozes.
-- Private chats can configure thresholds, monitor/price alerts, price-drop
-  sensitivity, reminders, and snoozes using the command list in
-  [docs/botfather-commands.txt](./docs/botfather-commands.txt).
-- The dashboard supports the same four thresholds, shows liquidation and BTC
-  price buffers, and links a displayed address directly to a Telegram start
-  subscription.
-- File, memory, and Upstash Redis stores persist subscriptions, alert settings,
-  levels, oracle price samples, reminder/snooze state, cooldowns, transfer
-  deduplication, poller position, and Telegram update offsets.
+| Area | Implemented and tested |
+| --- | --- |
+| Multi-user bot and Redis state | Private chats manage their own subscriptions and alert settings. The Redis store persists subscriptions, settings, levels, processed-block position, and Telegram update offsets. |
+| Four alert levels and price buffers | SAFE, MONITOR, WARNING, and DANGER levels use per-chat thresholds; health output and the dashboard show BTC price buffers to warning, danger, and liquidation. |
+| Price-drop alerts | The watcher detects configurable BTC price drops and alerts chats with active watched troves, subject to a cooldown. |
+| DANGER reminders and snooze buttons | DANGER reminders have a configurable cadence and maximum count. Inline buttons support health checks and one- or six-hour snoozes. |
+| Watchlist | Users can add, list, and remove addresses, within configured limits. |
+| What-if LTV calculation | The bot's `/whatif <btc price in USD> [address]` command estimates LTV and distance to liquidation at one supplied BTC price; it does not draw a price curve. |
+| Fix-my-loan calculator | The dashboard calculates the collateral or repayment amount for a target LTV. |
+| Protect my loan | For Mezo Testnet, the dashboard builds and simulates add-collateral or repayment plans; the connected user's wallet reviews, signs, and broadcasts the transaction. |
+| Single-instance lock and outage handling | The watcher uses a renewable poller lock and retries transient service failures; loss of the lock stops polling. |
+| Railway hosting | Railway Docker deployment configuration and environment-variable guidance are documented in [docs/DEPLOY.md](./docs/DEPLOY.md). |
+
+## Known limits
+
+- Mezo Testnet only.
+- The project and its transaction flow have not been audited.
+- Alert thresholds use my defaults and are configurable per chat.
+- Repayment is limited by Mezo's current minimum-debt requirement.
+- Health, what-if, transaction-plan, and fee values are estimates, not guarantees.
+- The what-if command evaluates one supplied BTC price per request; it does not draw a price curve.
+
+## Credits
+
+The restart-safe listener design and Web Push ideas come from my earlier
+project Mintroom; everything Mezo-related is new.
 
 Privacy: the service stores each subscribing Telegram chat id, its watched
 addresses and labels, alert thresholds, transfer preference, alert levels,
@@ -57,6 +67,15 @@ settings, alert levels, snoozes, cooldowns, and transfer dedupe keys. Global
 oracle samples, processed-block and Telegram-update offsets are retained.
 
 ## Run the dashboard
+
+### Protect my loan limits
+
+The wallet flow is Mezo Testnet only and has not been audited. It does not
+handle private keys or seed phrases; the wallet handles signing and
+broadcasting. Server-generated before/after values and fee estimates are
+estimates and may change before confirmation. This is not financial advice.
+The verified repayment function burns MUSD directly from the caller's
+balance, so it does not need or request an ERC-20 approval.
 
 ```sh
 cd web

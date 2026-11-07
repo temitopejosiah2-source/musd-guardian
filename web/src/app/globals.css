@@ -105,7 +105,36 @@ button:focus-visible, a:focus-visible, input:focus-visible {
 .result-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(315px, .85fr); gap: 14px; margin-top: 17px; }
 .card { border: 1px solid var(--border); border-radius: 13px; background: var(--surface); box-shadow: 0 10px 30px rgba(0,0,0,.08); }
 .health-card { padding: 21px 22px 0; }
-.card-topline { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.protect-panel { display: grid; gap: 12px; margin: 18px 0; padding: 16px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface-raised); }
+.protect-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.protect-heading h3 { margin: 4px 0 0; font-size: 16px; }
+.protect-privacy, .protect-hint, .protect-message, .protect-warning, .protect-testnet-warning { margin: 0; color: var(--muted); font-size: 11px; }
+.protect-tabs { display: flex; gap: 7px; }
+.protect-tabs button { min-height: 36px; padding: 0 11px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); background: var(--surface); cursor: pointer; font-size: 11px; }
+.protect-tabs button[aria-selected="true"] { border-color: var(--lime); color: var(--lime); background: var(--lime-dark); }
+.protect-inputs { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.protect-inputs label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
+.protect-inputs input { width: 100%; height: 39px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--text); background: var(--page); font-family: var(--mono); font-size: 12px; }
+.target-ltv-controls { display: flex; align-items: end; gap: 7px; }
+.target-ltv-controls label { flex: 1; }
+.target-ltv-controls .button { min-height: 39px; padding: 0 9px; font-size: 10px; }
+.protect-account { margin: 0; color: var(--muted); font-size: 11px; }
+.protect-account code, .protect-review code { font-family: var(--mono); overflow-wrap: anywhere; }
+.protect-review { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid var(--border); }
+.protect-review h4 { margin: 0; font-size: 14px; }
+.protect-review ol { display: grid; gap: 5px; margin: 0; padding-left: 20px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.protect-review a, .protect-receipt a { color: var(--lime); }
+.protect-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; padding: 9px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: 10px; }
+.protect-comparison > b { grid-column: 1 / -1; color: var(--text); font-size: 11px; }
+.protect-comparison strong { color: var(--text); }
+.protect-testnet-warning { color: var(--amber); font-weight: 700; }
+.protect-receipt { padding: 10px; border-radius: 7px; background: var(--surface-soft); font-size: 11px; overflow-wrap: anywhere; }
+.protect-receipt p { margin: 0 0 5px; }
+.protect-receipt p:last-child { margin-bottom: 0; }
+.protect-receipt a { display: block; margin-bottom: 6px; }
+.card-topline { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;   .protect-inputs { grid-template-columns: 1fr; }
+  .protect-tabs { flex-direction: column; }
+}
 .result-actions { display: flex; align-items: center; gap: 9px; }
 .level-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid currentColor; border-radius: 99px; font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .4px; white-space: nowrap; }
 .level-pill-safe { color: var(--green); background: color-mix(in srgb, var(--green), transparent 93%); }

@@ -10,8 +10,9 @@ import { decodeEventLog, formatUnits, getAddress } from "viem";
 import type { HealthLevel } from "./format";
 import { bufferPercent, priceAtLtv } from "./risk";
 import { getRequestSignal } from "./request-budget";
+import { EXPLORER_URL } from "./constants";
 
-export const EXPLORER_URL = "https://explorer.test.mezo.org";
+export { EXPLORER_URL } from "./constants";
 export const MUSD_ADDRESS =
   "0x118917a40FAF1CD7a13dB0Ef56C86De7973Ac503" as const;
 export const TROVE_MANAGER_ADDRESS =
@@ -117,7 +118,7 @@ const boundedFetch: typeof fetch = async (input, init) => {
   }
 };
 
-const publicClient = createPublicClient({
+export const publicClient = createPublicClient({
   chain,
   transport: http(getRpcUrl(), {
     timeout: RPC_TIMEOUT_MS,
@@ -211,7 +212,7 @@ function setCache<T>(
   cache.set(key, { expiresAt: now + lifetimeMs, value });
 }
 
-function getThresholds(): { monitor: number; warn: number; danger: number } {
+export function getThresholds(): { monitor: number; warn: number; danger: number } {
   const parseThreshold = (
     key: "MONITOR_LTV" | "WARN_LTV" | "DANGER_LTV",
     fallback: number,

@@ -11,7 +11,10 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Open `http://localhost:3000`. RPC and contract reads run server-side; no wallet or signing is needed to inspect an address.
+Open `http://localhost:3000`. RPC and contract reads run server-side; no wallet
+or signing is needed to inspect an address. The optional Protect my loan panel
+builds and simulates a plan on the server, then asks the user's browser wallet
+to review and sign it. See [../docs/PROTECT.md](../docs/PROTECT.md).
 
 ## Environment variables
 
@@ -50,9 +53,11 @@ only and can be reset or bypassed across serverless instances. Health reads
 have an independent 25-second budget; transfer scans use a separate 20-second
 budget and return partial activity when that limit is reached.
 
-The dashboard reads public testnet information only. It does not handle private
-keys or send blockchain transactions. Testnet RPC availability is not
-guaranteed. The project has not received an external security audit.
+The dashboard reads public testnet information. The optional wallet flow is
+Mezo Testnet only: the server never handles private keys or signs transactions,
+and only the user's wallet broadcasts the transaction. Testnet RPC availability
+is not guaranteed; estimates may change before mining. The project has not
+received an external security audit.
 
 ## Checks
 
