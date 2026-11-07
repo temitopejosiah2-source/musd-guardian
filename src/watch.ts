@@ -5,7 +5,7 @@ import { getHealthAlertConfig, getWatchAddress } from "./config.js";
 import { publicClient } from "./client.js";
 import { getMusdDecimals, LOG_CHUNK_SIZE } from "./musd.js";
 import { getLoanHealth, type LoanHealth } from "./loan.js";
-import { runHealthCycle, processTransferRange, transitionLevel, processPriceDropAlerts } from "./monitor.js";
+import { buildSimulatedAlert, runHealthCycle, processTransferRange, transitionLevel, processPriceDropAlerts } from "./monitor.js";
 import type { MessageSender } from "./monitor.js";
 import { OutboundQueue } from "./outbound.js";
 import { logError, logInfo, redact, registerChatId } from "./security.js";
@@ -206,15 +206,19 @@ async function runTelegramTest(store: Store): Promise<void> {
   const token = getToken();
   const address = getWatchAddress();
   const health = await getLoanHealth(address);
-  const message = [
-    "TEST (simulated, not your real loan)",
-    `Trove active: ${health.troveActive ? "yes" : "no"}`,
-    `LTV: ${health.ltvPercent.toFixed(2)}%`,
-  ].join("\n");
-  const queue = new OutboundQueue((chatId, text) => sendTelegramMessage(token, chatId, text), (chatId) => store.deleteChat(chatId));
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!chatId) throw new Error("--telegram-test requires TELEGRAM_CHAT_ID");
-  await queue.sendMessage(chatId, message);
+  const testArg = process.argv.indexOf("--telegram-test");
+  const ltv = testArg >= 0 && process.argv[testArg + 1] && !process.argv[testArg + 1]?.startsWith("--")
+    ? Number(process.argv[testArg + 1])
+    : 85;
+  const settings = await store.getSettings(chatId);
+  const { message, keyboard } = buildSimulatedAlert(health, ltv, settings, address);
+  const queue = new OutboundQueue(
+    (targetChat, text, replyMarkup) => sendTelegramMessage(token, targetChat, text, replyMarkup),
+    (targetChat) => store.deleteChat(targetChat),
+  );
+  await queue.sendMessage(chatId, message, keyboard);
   await queue.flush();
   await store.flush();
   logInfo("Sent one Telegram test alert.");

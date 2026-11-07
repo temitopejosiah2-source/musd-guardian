@@ -96,7 +96,7 @@ export class BotCommands {
         answer = "Please wait before using another button.";
         return;
       }
-      const match = /^(c|s1|s6):([0-9a-f]{40})$/i.exec(update.callbackData ?? "");
+      const match = /^(tc|ts1|ts6|c|s1|s6):([0-9a-f]{40})$/i.exec(update.callbackData ?? "");
       if (!match) return;
       let address: Address;
       try {
@@ -109,7 +109,11 @@ export class BotCommands {
         answer = "That address is no longer on your watch list.";
         return;
       }
-      if (match[1] !== "c") {
+      if (match[1]?.startsWith("ts")) {
+        answer = "This was a test alert, nothing was snoozed";
+        return;
+      }
+      if (match[1] === "s1" || match[1] === "s6") {
         const current = await this.dependencies.store.getLevel(chatId, address);
         const snoozeLevel = current?.level ?? "SAFE";
         const duration = match[1] === "s1" ? 60 * 60_000 : 6 * 60 * 60_000;
@@ -204,16 +208,22 @@ export class BotCommands {
       return `${formatAddress(address)} is now watched. Health data is temporarily unavailable; monitoring will retry.`;
     }
     const settings = await this.dependencies.store.getSettings(chatId);
-    const level = health.troveActive ? healthLevel(health.ltvPercent, settings) : "SAFE";
+    if (!health.troveActive) {
+      await this.dependencies.store.setLevel(chatId, address, {
+        level: "SAFE",
+        troveActive: false,
+        health,
+        reminderCount: 0,
+      });
+      return "No active loan found. I'll alert you if one appears.";
+    }
+    const level = healthLevel(health.ltvPercent, settings);
     await this.dependencies.store.setLevel(chatId, address, {
       level,
       troveActive: health.troveActive,
       health,
       reminderCount: 0,
     });
-    if (!health.troveActive) {
-      return `${formatAddress(address)} is now watched. No active trove was found; I'll alert you if one appears.\n${formatHealth(health, settings)}`;
-    }
     return `${formatAddress(address)} is now watched.\n${formatHealth(health, settings)}`;
   }
 
@@ -234,7 +244,10 @@ export class BotCommands {
       const snooze = state?.snoozedUntil && state.snoozedUntil > Date.now()
         ? ` (snoozed until ${new Date(state.snoozedUntil).toISOString()})`
         : "";
-      return `${label ? `${label}: ` : ""}${formatAddress(address)} — ${icon} ${level}${snooze}`;
+      const name = label ? `${label}: ` : "";
+      return state?.troveActive === false
+        ? `${name}${formatAddress(address)} — No active loan found. I'll alert you if one appears.`
+        : `${name}${formatAddress(address)} — ${icon} ${level}${snooze}`;
     }));
     return lines.join("\n");
   }
@@ -381,12 +394,12 @@ export function healthText(health: LoanHealth, settings = {
   warnLtv: Number(process.env.WARN_LTV ?? 70),
   dangerLtv: Number(process.env.DANGER_LTV ?? 80),
 }): string {
+  if (!health.troveActive) return "No active loan found. I'll alert you if one appears.";
   const liquidation = health.troveActive ? priceAtLtv(health.debtMusd, health.collateralBtc, 90) : null;
   const warn = health.troveActive ? priceAtLtv(health.debtMusd, health.collateralBtc, settings.warnLtv) : null;
   const danger = health.troveActive ? priceAtLtv(health.debtMusd, health.collateralBtc, settings.dangerLtv) : null;
   return [
     `Trove active: ${health.troveActive ? "yes" : "no"}`,
-    ...(!health.troveActive ? ["No active loan was found for this address."] : []),
     `LTV: ${health.ltvPercent.toFixed(2)}%`,
     `Collateral: ${health.collateralBtc} BTC`,
     `Debt: ${health.debtMusd} MUSD`,
@@ -403,12 +416,7 @@ export function healthText(health: LoanHealth, settings = {
 export function formatHealth(health: LoanHealth, settings: {
   monitorLtv: number; warnLtv: number; dangerLtv: number;
 }, snoozedUntil?: number): string {
-  if (!health.troveActive) {
-    const snooze = snoozedUntil && snoozedUntil > Date.now()
-      ? `\nSnoozed until ${new Date(snoozedUntil).toISOString()}`
-      : "";
-    return `Level: ⚪ NO_LOAN\n${healthText(health, settings)}${snooze}`;
-  }
+  if (!health.troveActive) return healthText(health, settings);
   const level = healthLevel(health.ltvPercent, settings);
   const snooze = snoozedUntil && snoozedUntil > Date.now()
     ? `\nSnoozed until ${new Date(snoozedUntil).toISOString()}`

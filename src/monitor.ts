@@ -279,20 +279,48 @@ function healthLevelIcon(level: HealthLevel): string {
   return level === "DANGER" ? "🔴" : level === "WARNING" ? "🟠" : level === "MONITOR" ? "🟡" : "🟢";
 }
 
-export function alertKeyboard(address: Address): InlineKeyboardMarkup {
+export function alertKeyboard(address: Address, testAlert = false): InlineKeyboardMarkup {
   const raw = address.slice(2).toLowerCase();
+  const testPrefix = testAlert ? "t" : "";
   return {
     inline_keyboard: [
       [
-        { text: "Check now", callback_data: `c:${raw}` },
-        { text: "Snooze 1h", callback_data: `s1:${raw}` },
-        { text: "Snooze 6h", callback_data: `s6:${raw}` },
+        { text: "Check now", callback_data: `${testPrefix}c:${raw}` },
+        { text: "Snooze 1h", callback_data: `${testPrefix}s1:${raw}` },
+        { text: "Snooze 6h", callback_data: `${testPrefix}s6:${raw}` },
       ],
       [
         { text: "Open Mezo Borrow", url: "https://testnet.mezo.org/borrow" },
         { text: "Explorer", url: `https://explorer.test.mezo.org/address/${getAddress(address)}` },
       ],
     ],
+  };
+}
+
+export function buildSimulatedAlert(
+  health: LoanHealth,
+  ltv: number,
+  settings: { monitorLtv: number; warnLtv: number; dangerLtv: number },
+  address: Address,
+): { message: string; keyboard: InlineKeyboardMarkup } {
+  if (!Number.isFinite(ltv) || ltv < 1 || ltv > 89) {
+    throw new Error("Simulated LTV must be between 1 and 89.");
+  }
+  if (!health.troveActive || health.collateralBtc <= 0 || health.debtMusd <= 0) {
+    throw new Error("A real active loan is required to send a simulated alert.");
+  }
+  const btcPriceUsd = health.debtMusd / (health.collateralBtc * ltv / 100);
+  const simulatedHealth: LoanHealth = {
+    ...health,
+    btcPriceUsd,
+    collateralValueUsd: health.collateralBtc * btcPriceUsd,
+    ltvPercent: ltv,
+    distanceToLiquidationPercent: 90 - ltv,
+  };
+  const level = transitionLevel(ltv, undefined, settings.monitorLtv, settings.warnLtv, settings.dangerLtv);
+  return {
+    message: `TEST (simulated, not your real loan)\n${healthAlert(level, simulatedHealth, settings)}`,
+    keyboard: alertKeyboard(address, true),
   };
 }
 

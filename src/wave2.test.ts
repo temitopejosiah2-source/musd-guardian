@@ -6,7 +6,9 @@ import { encodeAbiParameters, encodeEventTopics, parseAbiParameters, type Addres
 import { BotCommands, formatHealth } from "./bot.js";
 import {
   alertKeyboard,
+  buildSimulatedAlert,
   detectPriceDrop,
+  healthAlert,
   processPriceDropAlerts,
   processTransferRange,
   runHealthCycle,
@@ -386,8 +388,95 @@ describe("multi-user commands", () => {
       getHealth: async () => ({ ...fakeHealth(), troveActive: false }),
     });
     await bot.handle(update(`/watch ${address}`));
-    expect(messages[0]).toContain("No active trove was found");
+    expect(messages[0]).toBe("No active loan found. I'll alert you if one appears.");
     expect(await store.getSubscriptions("12345")).toHaveLength(1);
+  });
+
+  it("shows only the no-loan notice in health, watch, and list replies", async () => {
+    const store = new MemoryStore();
+    const messages: string[] = [];
+    const inactiveHealth = { ...fakeHealth(), troveActive: false };
+    const bot = new BotCommands({
+      store,
+      send: async (_chat, text) => { messages.push(text); },
+      getHealth: async () => inactiveHealth,
+    });
+
+    await bot.handle(update(`/watch ${address}`));
+    expect(messages.at(-1)).toBe("No active loan found. I'll alert you if one appears.");
+    await bot.handle(update(`/health ${address}`));
+    expect(messages.at(-1)).toBe("No active loan found. I'll alert you if one appears.");
+    await bot.handle(update("/list"));
+    expect(messages.at(-1)).toContain("No active loan found. I'll alert you if one appears.");
+    for (const message of messages) {
+      expect(message).not.toMatch(/LTV:|Distance to liquidation|unavailable/i);
+    }
+  });
+
+  it("builds a TEST alert with production formatting for the simulated LTV", () => {
+    const settings = { monitorLtv: 55, warnLtv: 70, dangerLtv: 80 };
+    const simulatedLtv = 85;
+    const result = buildSimulatedAlert(fakeHealth(), simulatedLtv, settings, address);
+    const expectedPrice = fakeHealth().debtMusd / (fakeHealth().collateralBtc * simulatedLtv / 100);
+    const simulatedHealth = {
+      ...fakeHealth(),
+      btcPriceUsd: expectedPrice,
+      collateralValueUsd: fakeHealth().collateralBtc * expectedPrice,
+      ltvPercent: simulatedLtv,
+      distanceToLiquidationPercent: 90 - simulatedLtv,
+    };
+
+    expect(result.message).toBe(
+      `TEST (simulated, not your real loan)\n${healthAlert("DANGER", simulatedHealth, settings)}`,
+    );
+    expect(result.message).toContain("Collateral: 1 BTC");
+    expect(result.message).toContain("Debt: 75000 MUSD");
+    expect(result.message).toContain(`BTC price: $${expectedPrice}`);
+    expect(result.keyboard.inline_keyboard[0]?.map((button) => button.text)).toEqual([
+      "Check now", "Snooze 1h", "Snooze 6h",
+    ]);
+    expect(result.keyboard.inline_keyboard[0]?.every((button) => button.callback_data?.startsWith("t"))).toBe(true);
+    expect(() => buildSimulatedAlert(fakeHealth(), 0, settings, address)).toThrow(/between 1 and 89/);
+    expect(() => buildSimulatedAlert(fakeHealth(), 90, settings, address)).toThrow(/between 1 and 89/);
+  });
+
+  it("answers TEST alert snoozes without changing state and handles TEST check callbacks normally", async () => {
+    const store = new MemoryStore();
+    const answers: string[] = [];
+    const messages: string[] = [];
+    await store.addSubscription("12345", { address }, limits);
+    await store.setLevel("12345", address, {
+      level: "WARNING",
+      troveActive: true,
+      reminderCount: 3,
+      snoozedUntil: 123456,
+      snoozeLevel: "WARNING",
+    });
+    const original = await store.getLevel("12345", address);
+    const bot = new BotCommands({
+      store,
+      send: async (_chat, text) => { messages.push(text); },
+      getHealth: async () => fakeHealth(),
+      answerCallback: async (_id, text) => { answers.push(text ?? ""); },
+    });
+    const callback = (id: string, data: string): TelegramUpdate => ({
+      updateId: 1,
+      callbackQueryId: id,
+      callbackData: data,
+      callbackChatId: 12345,
+      callbackChatType: "private",
+      callbackSenderId: 12345,
+      callbackSenderIsBot: false,
+    });
+
+    await bot.handle(callback("test-snooze", alertKeyboard(address, true).inline_keyboard[0]![1]!.callback_data!));
+    expect(answers[0]).toBe("This was a test alert, nothing was snoozed");
+    expect(await store.getLevel("12345", address)).toEqual(original);
+
+    await bot.handle(callback("test-check", alertKeyboard(address, true).inline_keyboard[0]![0]!.callback_data!));
+    expect(answers[1]).toBe("Health update sent.");
+    expect(messages[0]).toContain("LTV: 75.00%");
+    expect(messages[0]).not.toContain("TEST (simulated");
   });
 
   it("ignores non-private chats and bot senders", async () => {
@@ -435,7 +524,7 @@ describe("multi-user commands", () => {
     expect(text).toContain("BTC can fall");
     expect(formatHealth({ ...fakeHealth(), troveActive: false }, {
       monitorLtv: 55, warnLtv: 70, dangerLtv: 80,
-    })).toContain("⚪ NO_LOAN");
+    })).toBe("No active loan found. I'll alert you if one appears.");
   });
 
   it("does not echo markup-like user labels in messages", async () => {
